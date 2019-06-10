@@ -1,0 +1,15 @@
+# target architecture
+TARGET_ARCH="aarch64"
+TARGET_CPU="cortex-a53"
+
+# Kernel target
+KERNEL_TARGET="Image.lzo"
+KERNEL_EXTRA_TARGET="dtbs"
+KERNEL_BOOTIMG_OPTIONS="--base 0x0 --kernel_offset 0x1080000"
+KERNEL_EXTRA_DEPENDS="mkbootimg:host aml-dtbtools:host"
+
+# OpenGL-ES implementation to use
+OPENGLES="mesa"
+
+# additional packages to install. space separated list
+ADDITIONAL_PACKAGES="meson-firmware"

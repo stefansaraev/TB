@@ -1,0 +1,10 @@
+null::sysinit:/bin/mkdir -p /dev/pts
+null::sysinit:/bin/mount -t devpts none /dev/pts
+null::sysinit:/bin/mount -t tmpfs none /run
+null::sysinit:/etc/rc.d/rcS boot
+
+tty3::respawn:-/bin/sh
+
+::restart:/sbin/init
+::ctrlaltdel:/sbin/reboot
+null::shutdown:/etc/rc.d/rcS shutdown

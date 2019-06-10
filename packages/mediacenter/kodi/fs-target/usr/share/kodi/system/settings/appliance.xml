@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<settings>
+
+  <section id="player">
+    <category id="videoplayer">
+      <group id="2">
+        <setting id="videoplayer.adjustrefreshrate">
+          <default>2</default> <!-- ADJUST_REFRESHRATE_ON_STARTSTOP -->
+        </setting>
+        <setting id="videoplayer.stretch43">
+          <default>4</default> <!-- ViewModeStretch16x9 -->
+        </setting>
+      </group>
+    </category>
+    <category id="discs">
+      <visible>false</visible>
+    </category>
+  </section>
+
+  <section id="media">
+    <category id="filelists">
+      <group id="2">
+        <setting id="filelists.showhidden">
+          <visible>false</visible>
+          <default>true</default>
+        </setting>
+      </group>
+    </category>
+  </section>
+
+  <section id="pvr">
+    <category id="pvrmanager">
+      <group id="1">
+        <setting id="pvrmanager.backendchannelorder">
+          <default>false</default>
+        </setting>
+        <setting id="pvrmanager.usebackendchannelnumbers">
+          <default>true</default>
+        </setting>
+        <setting id="pvrmanager.channelmanager">
+          <visible>false</visible>
+        </setting>
+        <setting id="pvrmanager.groupmanager">
+          <visible>false</visible>
+        </setting>
+        <setting id="pvrmanager.channelscan">
+          <visible>false</visible>
+        </setting>
+      </group>
+    </category>
+    <category id="epg">
+      <group id="2">
+        <setting id="epg.preventupdateswhileplayingtv">
+          <visible>false</visible>
+          <default>true</default>
+        </setting>
+        <setting id="epg.ignoredbforclient">
+          <visible>false</visible>
+          <default>true</default>
+        </setting>
+      </group>
+    </category>
+    <category id="pvrplayback">
+      <group id="1">
+        <setting id="pvrplayback.switchtofullscreen">
+          <default>false</default>
+        </setting>
+        <setting id="pvrplayback.signalquality">
+          <visible>false</visible>
+          <default>false</default>
+        </setting>
+        <setting id="pvrplayback.confirmchannelswitch">
+          <default>false</default>
+        </setting>
+        <setting id="pvrplayback.channelentrytimeout">
+          <visible>false</visible>
+          <default>0</default>
+        </setting>
+        <setting id="pvrplayback.fps">
+          <visible>false</visible>
+          <default>0</default> <!-- OFF -->
+        </setting>
+      </group>
+      <group id="2">
+        <setting id="pvrplayback.enableradiords">
+          <default>false</default>
+        </setting>
+      </group>
+    </category>
+    <category id="pvrpowermanagement">
+      <visible>false</visible>
+    </category>
+    <category id="pvrclient">
+      <visible>false</visible>
+    </category>
+  </section>
+
+  <section id="services">
+    <category id="control">
+      <group id="2">
+        <setting id="services.esallinterfaces">
+          <default>false</default>
+          <visible>false</visible>
+        </setting>
+      </group>
+    </category>
+  </section>
+
+  <section id="games">
+    <category id="gamesgeneral">
+      <group id="1">
+        <setting id="gamesgeneral.enable">
+          <default>false</default>
+        </setting>
+      </group>
+    </category>
+  </section>
+
+  <section id="system">
+    <category id="display">
+      <group id="1">
+        <setting id="videoscreen.screen">
+          <visible>false</visible>
+        </setting>
+        <setting id="videoscreen.screenmode">
+          <visible>true</visible>
+          <default>0192001080050.00000pstd</default>
+        </setting>
+      </group>
+      <group id="3">
+        <setting id="videoscreen.noofbuffers">
+          <visible>false</visible>
+        </setting>
+      </group>
+    </category>
+    <category id="audio">
+      <group id="1">
+        <setting id="audiooutput.volumesteps">
+          <default>20</default>
+        </setting>
+        <setting id="audiooutput.config">
+          <default>1</default>
+        </setting>
+      </group>
+      <group id="2">
+        <visible>false</visible>
+        <setting id="audiooutput.guisoundmode">
+          <default>0</default> <!-- AE_SOUND_OFF -->
+        </setting>
+        <setting id="lookandfeel.soundskin">
+          <visible>false</visible>
+        </setting>
+      </group>
+    </category>
+    <category id="input">
+      <group id="2">
+        <setting id="input.enablemouse">
+          <default>false</default>
+        </setting>
+      </group>
+    </category>
+    <category id="addons">
+      <group id="1">
+        <setting id="addons.managedependencies">
+          <visible>false</visible>
+        </setting>
+        <setting id="addons.showrunning">
+          <visible>false</visible>
+        </setting>
+        <setting id="addons.unknownsources">
+          <default>true</default>
+        </setting>
+      </group>
+    </category>
+    <category id="logging">
+      <group id="1">
+        <setting id="debug.screenshotpath">
+          <default>/storage/.kodi/temp/</default>
+        </setting>
+      </group>
+      <group id="2">
+        <visible>false</visible>
+        <setting id="eventlog.enabled">
+          <default>false</default>
+        </setting>
+      </group>
+    </category>
+  </section>
+
+  <section id="interface">
+    <category id="regional">
+      <group id="2">
+        <setting id="locale.timeformat">
+          <default>HH:mm:ss</default>
+        </setting>
+        <setting id="locale.use24hourclock">
+          <default>24hours</default>
+        </setting>
+      </group>
+    </category>
+    <category id="skin">
+      <group id="1">
+        <setting id="lookandfeel.enablerssfeeds">
+          <visible>false</visible>
+          <default>false</default>
+        </setting>
+        <setting id="lookandfeel.rssedit">
+          <visible>false</visible>
+        </setting>
+      </group>
+    </category>
+  </section>
+
+</settings>

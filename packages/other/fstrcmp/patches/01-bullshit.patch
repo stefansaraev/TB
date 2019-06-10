@@ -1,0 +1,13 @@
+diff --git a/configure.ac b/configure.ac
+index 3e9f116..9360a6e 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -32,6 +32,8 @@ AC_ISC_POSIX
+ AC_OBJEXT
+ AC_EXEEXT
+ 
++LT_INIT([disable-shared])
++
+ dnl @synopsis AC_ADD_CFLAGS
+ dnl
+ dnl Add the given option to CFLAGS, if it doesn't break the compiler

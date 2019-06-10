@@ -1,0 +1,19 @@
+diff --git a/Makefile b/Makefile
+index 5a12d18..d463208 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,4 @@
+-prefix=/usr/local
++prefix=/usr
+ bindir=$(prefix)/bin
+ includedir=$(prefix)/include
+ libdir=$(prefix)/lib
+@@ -7,7 +7,7 @@ SRC = $(sort $(wildcard *.c))
+ OBJS = $(SRC:.c=.o)
+ 
+ ALL_INCLUDES=argp.h
+-ALL_LIBS=libargp.so libargp.a
++ALL_LIBS=libargp.a
+ 
+ CFLAGS=-O0 -fPIC -Wall
+ BUILDCFLAGS=$(CFLAGS) -I.

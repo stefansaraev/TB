@@ -1,0 +1,11 @@
+#!/bin/sh
+
+# SEQ=90
+
+case "$1" in
+  start)
+    udevadm trigger
+    ;;
+esac
+
+exit 0

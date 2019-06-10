@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# SEQ=97
+
+case "$1" in
+  start)
+    settings-mon &>/dev/null &
+    ;;
+  stop)
+    pkill -f settings-mon
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,13 @@
+diff --git a/src/gbm/meson.build b/src/gbm/meson.build
+index b7262c5..bb26382 100644
+--- a/src/gbm/meson.build
++++ b/src/gbm/meson.build
+@@ -43,7 +43,7 @@ if with_platform_wayland
+   incs_gbm += inc_wayland_drm
+ endif
+ 
+-libgbm = shared_library(
++libgbm = static_library(
+   'gbm',
+   files_gbm,
+   include_directories : incs_gbm,

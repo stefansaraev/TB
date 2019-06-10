@@ -1,0 +1,33 @@
+From d0682b02daa87bf15cc30f327b9d071d97c60970 Mon Sep 17 00:00:00 2001
+From: Thomas Petazzoni <thomas.petazzoni@bootlin.com>
+Date: Sat, 18 Aug 2018 10:54:56 +0200
+Subject: [PATCH 31/32] Add an option to disable uuid module
+
+Signed-off-by: Thomas Petazzoni <thomas.petazzoni@bootlin.com>
+---
+ configure.ac | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/configure.ac b/configure.ac
+index d07e371..55ab6c3 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3309,6 +3309,15 @@ if test "$CURSES" = "no"; then
+    DISABLED_EXTENSIONS="${DISABLED_EXTENSIONS} _curses _curses_panel"
+ fi
+ 
++AC_SUBST(UUID)
++AC_ARG_ENABLE(uuid,
++	AS_HELP_STRING([--disable-uuid], [disable uuid]),
++	[ UUID="${enableval}" ], [ UUID=yes ])
++
++if test "$UUID" = "no"; then
++   DISABLED_EXTENSIONS="${DISABLED_EXTENSIONS} _uuid"
++fi
++
+ AC_SUBST(PYDOC)
+ 
+ AC_ARG_ENABLE(pydoc,
+-- 
+2.20.1
+

@@ -1,0 +1,75 @@
+#!/bin/sh
+
+showcursor() {
+  echo -en "\033[?25h"
+  echo 2>/dev/null 1 > /sys/devices/virtual/graphics/fbcon/cursor_blink
+}
+
+hidecursor() {
+  echo -en "\033[?25l"
+  echo 2>/dev/null 0 > /sys/devices/virtual/graphics/fbcon/cursor_blink
+}
+
+error() {
+  echo "### Error: $1 ###"
+  showcursor
+  sh </dev/console >/dev/console 2>&1
+}
+
+load_splash() {
+  SPLASH="/splash/splash.png"
+  if [ -n "$1" ] ; then
+    SPLASH="$1"
+  fi
+  ply-image "$SPLASH" &>/dev/null
+}
+
+mount_part() {
+  ERR=1
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    mount -o "$3" "$1" "$2" &>/dev/null
+    [ "$?" -eq "0" ] && ERR=0 && break
+    sleep 0.25
+  done
+  [ "$ERR" -ne "0" ] && error "Could not mount $1"
+}
+
+mount_parts() {
+  mount_part "$boot" "/boot" "ro,noatime"
+  mount_part "$disk" "/storage" "rw,noatime"
+}
+
+prepare_sysroot() {
+  cp /boot/root.sqfs /dev/root.sqfs
+  mount_part "/dev/root.sqfs" "/sysroot" "ro,loop"
+
+  mkdir -p /storage/.config
+
+  for mount in boot storage dev sys tmp proc ; do
+    mount --move /$mount /sysroot/$mount
+  done
+}
+
+/bin/busybox mkdir -p /dev /proc /sys /tmp /boot /storage /sysroot
+/bin/busybox mount -t devtmpfs none /dev
+/bin/busybox mount -t proc none /proc
+/bin/busybox mount -t sysfs none /sys
+/bin/busybox mount -t tmpfs none /tmp
+
+chmod 1777 /tmp
+
+clear
+hidecursor
+
+for arg in $(cat /proc/cmdline); do
+  case $arg in
+    boot=*) boot="${arg#*=}" ;;
+    disk=*) disk="${arg#*=}" ;;
+  esac
+done
+
+for STEP in load_splash mount_parts prepare_sysroot; do
+  $STEP
+done
+
+exec /bin/busybox switch_root /sysroot /sbin/init

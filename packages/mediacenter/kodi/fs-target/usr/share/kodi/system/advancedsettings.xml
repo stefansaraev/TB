@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<advancedsettings>
+  <showexitbutton>false</showexitbutton>
+  <network>
+    <curlclienttimeout>2</curlclienttimeout>
+    <curllowspeedtime>0</curllowspeedtime>
+  </network>
+  <epg>
+    <lingertime>30</lingertime>
+  </epg>
+</advancedsettings>

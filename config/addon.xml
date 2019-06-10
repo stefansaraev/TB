@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="@ADDON_ID@" name="@ADDON_NAME@" version="@ADDON_VERSION@" provider-name="TB">
+  <extension point="xbmc.python.script"/>
+  <extension point="xbmc.addon.metadata">
+    <summary>@SUMMARY@</summary>
+    <description>
+@DESCRIPTION@
+    </description>
+    <platform>all</platform>
+  </extension>
+</addon>

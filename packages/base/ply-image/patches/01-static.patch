@@ -1,0 +1,12 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a5d6e13..80a5ec7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,6 +20,6 @@ else()
+ endif()
+ 
+ add_executable(ply-image ply-image.c)
+-target_link_libraries(ply-image ${PNG_LIBRARIES} ${LIBM})
++target_link_libraries(ply-image ${PNG_LIBRARIES} ${LIBM} libc.a)
+ 
+ install(TARGETS ply-image DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")

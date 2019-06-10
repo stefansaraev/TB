@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+case $TARGET_CPU in
+  cortex-a53)
+    TARGET_SUBARCH=armv8-a
+    TARGET_ABI=eabi
+    ;;
+esac
+
+TARGET_GCC_ARCH=aarch64
+TARGET_KERNEL_ARCH=arm64
+
+# setup ARCH specific *FLAGS
+TARGET_CFLAGS="-march=$TARGET_SUBARCH -mcpu=$TARGET_CPU -mabi=lp64 -Wno-psabi"
+TARGET_LDFLAGS="-march=$TARGET_SUBARCH -mtune=$TARGET_CPU"
+GCC_OPTS="--with-abi=lp64 --with-arch=$TARGET_SUBARCH"

@@ -1,0 +1,12 @@
+diff --git a/libtls.pc.in b/libtls.pc.in
+index 82a6a71..440c3a9 100644
+--- a/libtls.pc.in
++++ b/libtls.pc.in
+@@ -11,6 +11,6 @@ Version: @VERSION@
+ Requires:
+ Requires.private: libcrypto libssl
+ Conflicts:
+-Libs: -L${libdir} -ltls
++Libs: -L${libdir} -ltls -lssl -lcrypto -lpthread
+ Libs.private: @LIBS@ -lcrypto -lssl @PLATFORM_LDADD@
+ Cflags: -I${includedir}

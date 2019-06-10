@@ -1,0 +1,3 @@
+#!/bin/sh
+
+stdin=$(cat); wget --post-data 'f:1='"$stdin" http://ix.io -q -O -

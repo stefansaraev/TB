@@ -1,0 +1,20 @@
+#!/bin/sh
+
+# SEQ=00
+
+case "$1" in
+  start)
+    (
+      while : ; do
+        mkdir -p /run/udev
+        udevd
+        sleep 2
+      done
+    ) &
+    ;;
+  stop)
+    pkill -TERM -f udevd
+    ;;
+esac
+
+exit 0

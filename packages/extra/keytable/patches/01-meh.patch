@@ -1,0 +1,13 @@
+diff --git a/Makefile b/Makefile
+index 51c6921..1b701d1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@ CC ?= cc
+ STRIP ?= strip
+ 
+ all:
+-	${CC} -Wall keytable.c -o keytable
++	${CC} -Wall keytable.c -largp -static -o keytable
+ 	${STRIP} keytable
+ 
+ clean:

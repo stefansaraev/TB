@@ -1,0 +1,3589 @@
+From e6da3e47c7e7012e460c9e40c72b978de5d53773 Mon Sep 17 00:00:00 2001
+From: Maxime Jourdan <mjourdan@baylibre.com>
+Date: Wed, 29 Aug 2018 15:42:56 +0200
+Subject: [PATCH 01/12] WIP: media: meson: vdec: add H.264 decoding support
+
+Add support for V4L2_PIX_FMT_H264
+---
+ drivers/staging/media/meson/vdec/Makefile     |   2 +-
+ drivers/staging/media/meson/vdec/codec_h264.c | 478 ++++++++++++++++++
+ drivers/staging/media/meson/vdec/codec_h264.h |  13 +
+ .../staging/media/meson/vdec/vdec_platform.c  |  31 ++
+ 4 files changed, 523 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/staging/media/meson/vdec/codec_h264.c
+ create mode 100644 drivers/staging/media/meson/vdec/codec_h264.h
+
+diff --git a/drivers/staging/media/meson/vdec/Makefile b/drivers/staging/media/meson/vdec/Makefile
+index 6bea129084b76..711d990c760e0 100644
+--- a/drivers/staging/media/meson/vdec/Makefile
++++ b/drivers/staging/media/meson/vdec/Makefile
+@@ -3,6 +3,6 @@
+ 
+ meson-vdec-objs = esparser.o vdec.o vdec_helpers.o vdec_platform.o
+ meson-vdec-objs += vdec_1.o
+-meson-vdec-objs += codec_mpeg12.o
++meson-vdec-objs += codec_mpeg12.o codec_h264.o
+ 
+ obj-$(CONFIG_VIDEO_MESON_VDEC) += meson-vdec.o
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+new file mode 100644
+index 0000000000000..6ac0115afaa35
+--- /dev/null
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -0,0 +1,478 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2018 Maxime Jourdan <maxi.jourdan@wanadoo.fr>
++ */
++
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "vdec_helpers.h"
++#include "dos_regs.h"
++
++#define SIZE_EXT_FW	(20 * SZ_1K)
++#define SIZE_WORKSPACE	0x1ee000
++#define SIZE_SEI	(8 * SZ_1K)
++
++/* Offset added by the firmware which must be substracted
++ * from the workspace phyaddr
++ */
++#define WORKSPACE_BUF_OFFSET	0x1000000
++
++/* ISR status */
++#define CMD_MASK		GENMASK(7, 0)
++#define CMD_SRC_CHANGE		1
++#define CMD_FRAMES_READY	2
++#define CMD_FATAL_ERROR		6
++#define CMD_BAD_WIDTH		7
++#define CMD_BAD_HEIGHT		8
++
++#define SEI_DATA_READY	BIT(15)
++
++/* Picture type */
++#define PIC_TOP_BOT	5
++#define PIC_BOT_TOP	6
++
++/* Size of Motion Vector per macroblock */
++#define MB_MV_SIZE	96
++
++/* Frame status data */
++#define PIC_STRUCT_BIT	5
++#define PIC_STRUCT_MASK	GENMASK(2, 0)
++#define BUF_IDX_MASK	GENMASK(4, 0)
++#define ERROR_FLAG	BIT(9)
++#define OFFSET_BIT	16
++#define OFFSET_MASK	GENMASK(15, 0)
++
++/* Bitstream parsed data */
++#define MB_TOTAL_BIT	8
++#define MB_TOTAL_MASK	GENMASK(15, 0)
++#define MB_WIDTH_MASK	GENMASK(7, 0)
++#define MAX_REF_BIT	24
++#define MAX_REF_MASK	GENMASK(6, 0)
++#define AR_IDC_BIT	16
++#define AR_IDC_MASK	GENMASK(7, 0)
++#define AR_PRESENT_FLAG	BIT(0)
++#define AR_EXTEND	0xff
++
++/* Buffer to send to the ESPARSER to signal End Of Stream for H.264.
++ * This is a 16x16 encoded picture that will trigger drain firmware-side.
++ * There is no known alternative.
++ */
++static const u8 eos_sequence[SZ_1K] = {
++	0x00, 0x00, 0x00, 0x01, 0x06, 0x05, 0xff, 0xe4, 0xdc, 0x45, 0xe9, 0xbd,
++	0xe6, 0xd9, 0x48, 0xb7,	0x96, 0x2c, 0xd8, 0x20, 0xd9, 0x23, 0xee, 0xef,
++	0x78, 0x32, 0x36, 0x34, 0x20, 0x2d, 0x20, 0x63,	0x6f, 0x72, 0x65, 0x20,
++	0x36, 0x37, 0x20, 0x72, 0x31, 0x31, 0x33, 0x30, 0x20, 0x38, 0x34, 0x37,
++	0x35, 0x39, 0x37, 0x37, 0x20, 0x2d, 0x20, 0x48, 0x2e, 0x32, 0x36, 0x34,
++	0x2f, 0x4d, 0x50, 0x45,	0x47, 0x2d, 0x34, 0x20, 0x41, 0x56, 0x43, 0x20,
++	0x63, 0x6f, 0x64, 0x65, 0x63, 0x20, 0x2d, 0x20,	0x43, 0x6f, 0x70, 0x79,
++	0x6c, 0x65, 0x66, 0x74, 0x20, 0x32, 0x30, 0x30, 0x33, 0x2d, 0x32, 0x30,
++	0x30, 0x39, 0x20, 0x2d, 0x20, 0x68, 0x74, 0x74, 0x70, 0x3a, 0x2f, 0x2f,
++	0x77, 0x77, 0x77, 0x2e,	0x76, 0x69, 0x64, 0x65, 0x6f, 0x6c, 0x61, 0x6e,
++	0x2e, 0x6f, 0x72, 0x67, 0x2f, 0x78, 0x32, 0x36,	0x34, 0x2e, 0x68, 0x74,
++	0x6d, 0x6c, 0x20, 0x2d, 0x20, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x73,
++	0x3a, 0x20, 0x63, 0x61, 0x62, 0x61, 0x63, 0x3d, 0x31, 0x20, 0x72, 0x65,
++	0x66, 0x3d, 0x31, 0x20,	0x64, 0x65, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x3d,
++	0x31, 0x3a, 0x30, 0x3a, 0x30, 0x20, 0x61, 0x6e,	0x61, 0x6c, 0x79, 0x73,
++	0x65, 0x3d, 0x30, 0x78, 0x31, 0x3a, 0x30, 0x78, 0x31, 0x31, 0x31, 0x20,
++	0x6d, 0x65, 0x3d, 0x68, 0x65, 0x78, 0x20, 0x73, 0x75, 0x62, 0x6d, 0x65,
++	0x3d, 0x36, 0x20, 0x70,	0x73, 0x79, 0x5f, 0x72, 0x64, 0x3d, 0x31, 0x2e,
++	0x30, 0x3a, 0x30, 0x2e, 0x30, 0x20, 0x6d, 0x69,	0x78, 0x65, 0x64, 0x5f,
++	0x72, 0x65, 0x66, 0x3d, 0x30, 0x20, 0x6d, 0x65, 0x5f, 0x72, 0x61, 0x6e,
++	0x67, 0x65, 0x3d, 0x31, 0x36, 0x20, 0x63, 0x68, 0x72, 0x6f, 0x6d, 0x61,
++	0x5f, 0x6d, 0x65, 0x3d,	0x31, 0x20, 0x74, 0x72, 0x65, 0x6c, 0x6c, 0x69,
++	0x73, 0x3d, 0x30, 0x20, 0x38, 0x78, 0x38, 0x64,	0x63, 0x74, 0x3d, 0x30,
++	0x20, 0x63, 0x71, 0x6d, 0x3d, 0x30, 0x20, 0x64, 0x65, 0x61, 0x64, 0x7a,
++	0x6f, 0x6e, 0x65, 0x3d, 0x32, 0x31, 0x2c, 0x31, 0x31, 0x20, 0x63, 0x68,
++	0x72, 0x6f, 0x6d, 0x61,	0x5f, 0x71, 0x70, 0x5f, 0x6f, 0x66, 0x66, 0x73,
++	0x65, 0x74, 0x3d, 0x2d, 0x32, 0x20, 0x74, 0x68,	0x72, 0x65, 0x61, 0x64,
++	0x73, 0x3d, 0x31, 0x20, 0x6e, 0x72, 0x3d, 0x30, 0x20, 0x64, 0x65, 0x63,
++	0x69, 0x6d, 0x61, 0x74, 0x65, 0x3d, 0x31, 0x20, 0x6d, 0x62, 0x61, 0x66,
++	0x66, 0x3d, 0x30, 0x20,	0x62, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x73, 0x3d,
++	0x30, 0x20, 0x6b, 0x65, 0x79, 0x69, 0x6e, 0x74,	0x3d, 0x32, 0x35, 0x30,
++	0x20, 0x6b, 0x65, 0x79, 0x69, 0x6e, 0x74, 0x5f, 0x6d, 0x69, 0x6e, 0x3d,
++	0x32, 0x35, 0x20, 0x73, 0x63, 0x65, 0x6e, 0x65, 0x63, 0x75, 0x74, 0x3d,
++	0x34, 0x30, 0x20, 0x72,	0x63, 0x3d, 0x61, 0x62, 0x72, 0x20, 0x62, 0x69,
++	0x74, 0x72, 0x61, 0x74, 0x65, 0x3d, 0x31, 0x30,	0x20, 0x72, 0x61, 0x74,
++	0x65, 0x74, 0x6f, 0x6c, 0x3d, 0x31, 0x2e, 0x30, 0x20, 0x71, 0x63, 0x6f,
++	0x6d, 0x70, 0x3d, 0x30, 0x2e, 0x36, 0x30, 0x20, 0x71, 0x70, 0x6d, 0x69,
++	0x6e, 0x3d, 0x31, 0x30,	0x20, 0x71, 0x70, 0x6d, 0x61, 0x78, 0x3d, 0x35,
++	0x31, 0x20, 0x71, 0x70, 0x73, 0x74, 0x65, 0x70,	0x3d, 0x34, 0x20, 0x69,
++	0x70, 0x5f, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x3d, 0x31, 0x2e, 0x34, 0x30,
++	0x20, 0x61, 0x71, 0x3d, 0x31, 0x3a, 0x31, 0x2e, 0x30, 0x30, 0x00, 0x80,
++	0x00, 0x00, 0x00, 0x01,	0x67, 0x4d, 0x40, 0x0a, 0x9a, 0x74, 0xf4, 0x20,
++	0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x06,	0x51, 0xe2, 0x44, 0xd4,
++	0x00, 0x00, 0x00, 0x01, 0x68, 0xee, 0x32, 0xc8, 0x00, 0x00, 0x00, 0x01,
++	0x65, 0x88, 0x80, 0x20, 0x00, 0x08, 0x7f, 0xea, 0x6a, 0xe2, 0x99, 0xb6,
++	0x57, 0xae, 0x49, 0x30,	0xf5, 0xfe, 0x5e, 0x46, 0x0b, 0x72, 0x44, 0xc4,
++	0xe1, 0xfc, 0x62, 0xda, 0xf1, 0xfb, 0xa2, 0xdb,	0xd6, 0xbe, 0x5c, 0xd7,
++	0x24, 0xa3, 0xf5, 0xb9, 0x2f, 0x57, 0x16, 0x49, 0x75, 0x47, 0x77, 0x09,
++	0x5c, 0xa1, 0xb4, 0xc3, 0x4f, 0x60, 0x2b, 0xb0, 0x0c, 0xc8, 0xd6, 0x66,
++	0xba, 0x9b, 0x82, 0x29,	0x33, 0x92, 0x26, 0x99, 0x31, 0x1c, 0x7f, 0x9b
++};
++
++static const u8 *codec_h264_eos_sequence(u32 *len)
++{
++	*len = ARRAY_SIZE(eos_sequence);
++	return eos_sequence;
++}
++
++struct codec_h264 {
++	/* H.264 decoder requires an extended firmware */
++	void      *ext_fw_vaddr;
++	dma_addr_t ext_fw_paddr;
++
++	/* Buffer for the H.264 Workspace */
++	void      *workspace_vaddr;
++	dma_addr_t workspace_paddr;
++
++	/* Buffer for the H.264 references MV */
++	void      *ref_vaddr;
++	dma_addr_t ref_paddr;
++	u32	   ref_size;
++
++	/* Buffer for parsed SEI data */
++	void      *sei_vaddr;
++	dma_addr_t sei_paddr;
++
++	u32 mb_width;
++	u32 mb_height;
++	u32 max_refs;
++};
++
++static int codec_h264_can_recycle(struct amvdec_core *core)
++{
++	return !amvdec_read_dos(core, AV_SCRATCH_7) ||
++	       !amvdec_read_dos(core, AV_SCRATCH_8);
++}
++
++static void codec_h264_recycle(struct amvdec_core *core, u32 buf_idx)
++{
++	/* Tell the decoder he can recycle this buffer.
++	 * AV_SCRATCH_8 serves the same purpose.
++	 */
++	if (!amvdec_read_dos(core, AV_SCRATCH_7))
++		amvdec_write_dos(core, AV_SCRATCH_7, buf_idx + 1);
++	else
++		amvdec_write_dos(core, AV_SCRATCH_8, buf_idx + 1);
++}
++
++static int codec_h264_start(struct amvdec_session *sess) {
++	u32 workspace_offset;
++	struct amvdec_core *core = sess->core;
++	struct codec_h264 *h264 = sess->priv;
++
++	/* Allocate some memory for the H.264 decoder's state */
++	h264->workspace_vaddr = dma_alloc_coherent(core->dev, SIZE_WORKSPACE,
++					   &h264->workspace_paddr, GFP_KERNEL);
++	if (!h264->workspace_vaddr) {
++		dev_err(core->dev, "Failed to alloc H.264 Workspace\n");
++		return -ENOMEM;
++	}
++
++	/* Allocate some memory for the H.264 SEI dump */
++	h264->sei_vaddr = dma_alloc_coherent(core->dev, SIZE_SEI,
++					     &h264->sei_paddr, GFP_KERNEL);
++	if (!h264->sei_vaddr) {
++		dev_err(core->dev, "Failed to alloc H.264 SEI\n");
++		return -ENOMEM;
++	}
++
++	amvdec_write_dos_bits(core, POWER_CTL_VLD, BIT(9) | BIT(6));
++
++	workspace_offset = h264->workspace_paddr - WORKSPACE_BUF_OFFSET;
++	amvdec_write_dos(core, AV_SCRATCH_1, workspace_offset);
++	amvdec_write_dos(core, AV_SCRATCH_G, h264->ext_fw_paddr);
++	amvdec_write_dos(core, AV_SCRATCH_I, h264->sei_paddr - workspace_offset);
++
++	/* Enable "error correction" */
++	amvdec_write_dos(core, AV_SCRATCH_F,
++			 (amvdec_read_dos(core, AV_SCRATCH_F) & 0xffffffc3) |
++			 BIT(4) | BIT(7));
++
++	amvdec_write_dos(core, MDEC_PIC_DC_THRESH, 0x404038aa);
++
++	return 0;
++}
++
++static int codec_h264_stop(struct amvdec_session *sess)
++{
++	struct codec_h264 *h264 = sess->priv;
++	struct amvdec_core *core = sess->core;
++
++	if (h264->ext_fw_vaddr)
++		dma_free_coherent(core->dev, SIZE_EXT_FW,
++				  h264->ext_fw_vaddr, h264->ext_fw_paddr);
++
++	if (h264->workspace_vaddr)
++		dma_free_coherent(core->dev, SIZE_WORKSPACE,
++				 h264->workspace_vaddr, h264->workspace_paddr);
++
++	if (h264->ref_vaddr)
++		dma_free_coherent(core->dev, h264->ref_size,
++				  h264->ref_vaddr, h264->ref_paddr);
++
++	if (h264->sei_vaddr)
++		dma_free_coherent(core->dev, SIZE_SEI,
++				  h264->sei_vaddr, h264->sei_paddr);
++
++	return 0;
++}
++
++static int codec_h264_load_extended_firmware(struct amvdec_session *sess,
++					     const u8 *data, u32 len)
++{
++	struct codec_h264 *h264;
++	struct amvdec_core *core = sess->core;
++
++	if (len < SIZE_EXT_FW)
++		return -EINVAL;
++
++	h264 = kzalloc(sizeof(*h264), GFP_KERNEL);
++	if (!h264)
++		return -ENOMEM;
++
++	h264->ext_fw_vaddr = dma_alloc_coherent(core->dev, SIZE_EXT_FW,
++					      &h264->ext_fw_paddr, GFP_KERNEL);
++	if (!h264->ext_fw_vaddr) {
++		dev_err(core->dev, "Failed to alloc H.264 extended fw\n");
++		kfree(h264);
++		return -ENOMEM;
++	}
++
++	memcpy(h264->ext_fw_vaddr, data, SIZE_EXT_FW);
++	sess->priv = h264;
++
++	return 0;
++}
++
++static const struct v4l2_fract par_table[] = {
++	{ 1, 1 },   { 1, 1 },    { 12, 11 }, { 10, 11 },
++	{ 16, 11 }, { 40, 33 },  { 24, 11 }, { 20, 11 },
++	{ 32, 11 }, { 80, 33 },  { 18, 11 }, { 15, 11 },
++	{ 64, 33 }, { 160, 99 }, { 4, 3 },   { 3, 2 },
++	{ 2, 1 }
++};
++
++static void codec_h264_set_par(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	u32 seq_info = amvdec_read_dos(core, AV_SCRATCH_2);
++	u32 ar_idc = (seq_info >> AR_IDC_BIT) & AR_IDC_MASK;
++
++	if (!(seq_info & AR_PRESENT_FLAG))
++		return;
++
++	if (ar_idc == AR_EXTEND) {
++		u32 ar_info = amvdec_read_dos(core, AV_SCRATCH_3);
++		sess->pixelaspect.numerator = ar_info & 0xffff;
++		sess->pixelaspect.denominator = (ar_info >> 16) & 0xffff;
++		return;
++	}
++
++	if (ar_idc >= ARRAY_SIZE(par_table))
++		return;
++
++	sess->pixelaspect = par_table[ar_idc];
++}
++
++static void codec_h264_resume(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	struct codec_h264 *h264 = sess->priv;
++	u32 mb_width, mb_height, mb_total;
++
++	amvdec_set_canvases(sess, (u32[]){ ANC0_CANVAS_ADDR, 0 },
++				  (u32[]){ 24, 0 });
++
++	dev_dbg(core->dev,
++		"max_refs = %u; actual_dpb_size = %u\n",
++		h264->max_refs, sess->num_dst_bufs);
++
++	/* Align to a multiple of 4 macroblocks */
++	mb_width = ALIGN(h264->mb_width, 4);
++	mb_height = ALIGN(h264->mb_height, 4);
++	mb_total = mb_width * mb_height;
++
++	h264->ref_size = mb_total * MB_MV_SIZE * h264->max_refs;
++	h264->ref_vaddr = dma_alloc_coherent(core->dev, h264->ref_size,
++					     &h264->ref_paddr, GFP_KERNEL);
++	if (!h264->ref_vaddr) {
++		dev_err(core->dev, "Failed to alloc refs (%u)\n",
++			h264->ref_size);
++		amvdec_abort(sess);
++		return;
++	}
++
++	/* Address to store the references' MVs */
++	amvdec_write_dos(core, AV_SCRATCH_1, h264->ref_paddr);
++	/* End of ref MV */
++	amvdec_write_dos(core, AV_SCRATCH_4, h264->ref_paddr + h264->ref_size);
++
++	amvdec_write_dos(core, AV_SCRATCH_0, (h264->max_refs << 24) |
++					     (sess->num_dst_bufs << 16) |
++					     ((h264->max_refs - 1) << 8));
++}
++
++/* Configure the H.264 decoder when the parser detected a parameter set change
++ */
++static void codec_h264_src_change(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	struct codec_h264 *h264 = sess->priv;
++	u32 parsed_info, mb_total;
++	u32 crop_infor, crop_bottom, crop_right;
++	u32 frame_width, frame_height;
++
++	sess->keyframe_found = 1;
++
++	parsed_info = amvdec_read_dos(core, AV_SCRATCH_1);
++
++	/* Total number of 16x16 macroblocks */
++	mb_total = (parsed_info >> MB_TOTAL_BIT) & MB_TOTAL_MASK;
++	/* Number of macroblocks per line */
++	h264->mb_width = parsed_info & MB_WIDTH_MASK;
++	/* Number of macroblock lines */
++	h264->mb_height = mb_total / h264->mb_width;
++
++	h264->max_refs = ((parsed_info >> MAX_REF_BIT) & MAX_REF_MASK) + 1;
++
++	crop_infor = amvdec_read_dos(core, AV_SCRATCH_6);
++	crop_bottom = (crop_infor & 0xff);
++	crop_right = (crop_infor >> 16) & 0xff;
++
++	frame_width = h264->mb_width * 16 - crop_right;
++	frame_height = h264->mb_height * 16 - crop_bottom;
++
++	dev_info(core->dev, "frame: %ux%u; crop: %u %u\n",
++		 frame_width, frame_height, crop_right, crop_bottom);
++
++	codec_h264_set_par(sess);
++	amvdec_src_change(sess, frame_width, frame_height, h264->max_refs + 5);
++}
++
++/**
++ * The offset is split in half in 2 different registers
++ */
++static u32 get_offset_msb(struct amvdec_core *core, int frame_num)
++{
++	int take_msb = frame_num % 2;
++	int reg_offset = (frame_num / 2) * 4;
++	u32 offset_msb = amvdec_read_dos(core, AV_SCRATCH_A + reg_offset);
++
++	if (take_msb)
++		return offset_msb & 0xffff0000;
++
++	return (offset_msb & 0x0000ffff) << 16;
++}
++
++static void codec_h264_frames_ready(struct amvdec_session *sess, u32 status)
++{
++	struct amvdec_core *core = sess->core;
++	int error_count;
++	int num_frames;
++	int i;
++
++	error_count = amvdec_read_dos(core, AV_SCRATCH_D);
++	num_frames = (status >> 8) & 0xff;
++	if (error_count) {
++		dev_warn(core->dev,
++			"decoder error(s) happened, count %d\n", error_count);
++		amvdec_write_dos(core, AV_SCRATCH_D, 0);
++	}
++
++	for (i = 0; i < num_frames; i++) {
++		u32 frame_status = amvdec_read_dos(core, AV_SCRATCH_1 + i * 4);
++		u32 buffer_index = frame_status & BUF_IDX_MASK;
++		u32 pic_struct = (frame_status >> PIC_STRUCT_BIT) &
++				 PIC_STRUCT_MASK;
++		u32 offset = (frame_status >> OFFSET_BIT) & OFFSET_MASK;
++		u32 field = V4L2_FIELD_NONE;
++
++		/* A buffer decode error means it was decoded,
++		 * but part of the picture will have artifacts.
++		 * Typical reason is a temporarily corrupted bitstream
++		 */
++		if (frame_status & ERROR_FLAG)
++			dev_dbg(core->dev, "Buffer %d decode error\n",
++				buffer_index);
++
++		if (pic_struct == PIC_TOP_BOT)
++			field = V4L2_FIELD_INTERLACED_TB;
++		else if (pic_struct == PIC_BOT_TOP)
++			field = V4L2_FIELD_INTERLACED_BT;
++
++		offset |= get_offset_msb(core, i);
++		amvdec_dst_buf_done_idx(sess, buffer_index, offset, field);
++	}
++}
++
++static irqreturn_t codec_h264_threaded_isr(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	u32 status;
++	u32 size;
++	u8 cmd;
++
++	status = amvdec_read_dos(core, AV_SCRATCH_0);
++	cmd = status & CMD_MASK;
++
++	switch (cmd) {
++	case CMD_SRC_CHANGE:
++		codec_h264_src_change(sess);
++		break;
++	case CMD_FRAMES_READY:
++		codec_h264_frames_ready(sess, status);
++		break;
++	case CMD_FATAL_ERROR:
++		dev_err(core->dev, "H.264 decoder fatal error\n");
++		goto abort;
++	case CMD_BAD_WIDTH:
++		size = (amvdec_read_dos(core, AV_SCRATCH_1) + 1) * 16;
++		dev_err(core->dev, "Unsupported video width: %u\n", size);
++		goto abort;
++	case CMD_BAD_HEIGHT:
++		size = (amvdec_read_dos(core, AV_SCRATCH_1) + 1) * 16;
++		dev_err(core->dev, "Unsupported video height: %u\n", size);
++		goto abort;
++	case 0: /* Unused but not worth printing for */
++	case 9:
++		break;
++	default:
++		dev_info(core->dev, "Unexpected H264 ISR: %08X\n", cmd);
++		break;
++	}
++
++	if (cmd && cmd != CMD_SRC_CHANGE)
++		amvdec_write_dos(core, AV_SCRATCH_0, 0);
++
++	/* Decoder has some SEI data for us ; ignore */
++	if (amvdec_read_dos(core, AV_SCRATCH_J) & SEI_DATA_READY)
++		amvdec_write_dos(core, AV_SCRATCH_J, 0);
++
++	return IRQ_HANDLED;
++abort:
++	amvdec_abort(sess);
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t codec_h264_isr(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++
++	amvdec_write_dos(core, ASSIST_MBOX1_CLR_REG, 1);
++
++	return IRQ_WAKE_THREAD;
++}
++
++struct amvdec_codec_ops codec_h264_ops = {
++	.start = codec_h264_start,
++	.stop = codec_h264_stop,
++	.load_extended_firmware = codec_h264_load_extended_firmware,
++	.isr = codec_h264_isr,
++	.threaded_isr = codec_h264_threaded_isr,
++	.can_recycle = codec_h264_can_recycle,
++	.recycle = codec_h264_recycle,
++	.eos_sequence = codec_h264_eos_sequence,
++	.resume = codec_h264_resume,
++};
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.h b/drivers/staging/media/meson/vdec/codec_h264.h
+new file mode 100644
+index 0000000000000..7a1597611faff
+--- /dev/null
++++ b/drivers/staging/media/meson/vdec/codec_h264.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (C) 2018 Maxime Jourdan <maxi.jourdan@wanadoo.fr>
++ */
++
++#ifndef __MESON_VDEC_CODEC_H264_H_
++#define __MESON_VDEC_CODEC_H264_H_
++
++#include "vdec.h"
++
++extern struct amvdec_codec_ops codec_h264_ops;
++
++#endif
+\ No newline at end of file
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+index 824dbc7f46f56..579d3e48f0b29 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -9,9 +9,20 @@
+ 
+ #include "vdec_1.h"
+ #include "codec_mpeg12.h"
++#include "codec_h264.h"
+ 
+ static const struct amvdec_format vdec_formats_gxbb[] = {
+ 	{
++		.pixfmt = V4L2_PIX_FMT_H264,
++		.min_buffers = 2,
++		.max_buffers = 24,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_h264_ops,
++		.firmware_path = "meson/gxbb/vh264_mc",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++	}, {
+ 		.pixfmt = V4L2_PIX_FMT_MPEG1,
+ 		.min_buffers = 8,
+ 		.max_buffers = 8,
+@@ -36,6 +47,16 @@ static const struct amvdec_format vdec_formats_gxbb[] = {
+ 
+ static const struct amvdec_format vdec_formats_gxl[] = {
+ 	{
++		.pixfmt = V4L2_PIX_FMT_H264,
++		.min_buffers = 2,
++		.max_buffers = 24,
++		.max_width = 3840,
++		.max_height = 2160,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_h264_ops,
++		.firmware_path = "meson/gxl/vh264_mc",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++	}, {
+ 		.pixfmt = V4L2_PIX_FMT_MPEG1,
+ 		.min_buffers = 8,
+ 		.max_buffers = 8,
+@@ -60,6 +81,16 @@ static const struct amvdec_format vdec_formats_gxl[] = {
+ 
+ static const struct amvdec_format vdec_formats_gxm[] = {
+ 	{
++		.pixfmt = V4L2_PIX_FMT_H264,
++		.min_buffers = 2,
++		.max_buffers = 24,
++		.max_width = 3840,
++		.max_height = 2160,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_h264_ops,
++		.firmware_path = "meson/gxm/vh264_mc",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++	}, {
+ 		.pixfmt = V4L2_PIX_FMT_MPEG1,
+ 		.min_buffers = 8,
+ 		.max_buffers = 8,
+-- 
+2.24.0
+
+
+From 3a84e419b43d835a52ce7dada7b61cf09e3c22b2 Mon Sep 17 00:00:00 2001
+From: Maxime Jourdan <mjourdan@baylibre.com>
+Date: Wed, 29 Aug 2018 16:01:55 +0200
+Subject: [PATCH 02/12] WIP: media: meson: vdec: add MPEG4 decoding support
+
+Add support for V4L2_PIX_FMT_MPEG4, V4L2_PIX_FMT_XVID and V4L2_PIX_FMT_H.263
+---
+ drivers/staging/media/meson/vdec/Makefile     |   2 +-
+ .../staging/media/meson/vdec/codec_mpeg4.c    | 139 ++++++++++++++++++
+ .../staging/media/meson/vdec/codec_mpeg4.h    |  13 ++
+ .../staging/media/meson/vdec/vdec_platform.c  |  91 ++++++++++++
+ 4 files changed, 244 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/staging/media/meson/vdec/codec_mpeg4.c
+ create mode 100644 drivers/staging/media/meson/vdec/codec_mpeg4.h
+
+diff --git a/drivers/staging/media/meson/vdec/Makefile b/drivers/staging/media/meson/vdec/Makefile
+index 711d990c760e0..f167a61acb36d 100644
+--- a/drivers/staging/media/meson/vdec/Makefile
++++ b/drivers/staging/media/meson/vdec/Makefile
+@@ -3,6 +3,6 @@
+ 
+ meson-vdec-objs = esparser.o vdec.o vdec_helpers.o vdec_platform.o
+ meson-vdec-objs += vdec_1.o
+-meson-vdec-objs += codec_mpeg12.o codec_h264.o
++meson-vdec-objs += codec_mpeg12.o codec_h264.o codec_mpeg4.o
+ 
+ obj-$(CONFIG_VIDEO_MESON_VDEC) += meson-vdec.o
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg4.c b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+new file mode 100644
+index 0000000000000..1d574e5761125
+--- /dev/null
++++ b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2018 Maxime Jourdan <maxi.jourdan@wanadoo.fr>
++ */
++
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "vdec_helpers.h"
++#include "dos_regs.h"
++
++#define SIZE_WORKSPACE		SZ_1M
++/* Offset added by firmware, to substract from workspace paddr */
++#define DCAC_BUFF_START_IP	0x02b00000
++
++/* map firmware registers to known MPEG4 functions */
++#define MREG_BUFFERIN		AV_SCRATCH_8
++#define MREG_BUFFEROUT		AV_SCRATCH_9
++#define MP4_NOT_CODED_CNT	AV_SCRATCH_A
++#define MP4_OFFSET_REG		AV_SCRATCH_C
++#define MEM_OFFSET_REG		AV_SCRATCH_F
++#define MREG_FATAL_ERROR	AV_SCRATCH_L
++
++#define BUF_IDX_MASK		GENMASK(2, 0)
++#define INTERLACE_FLAG		BIT(7)
++#define TOP_FIELD_FIRST_FLAG	BIT(6)
++
++struct codec_mpeg4 {
++	/* Buffer for the MPEG4 Workspace */
++	void      *workspace_vaddr;
++	dma_addr_t workspace_paddr;
++};
++
++static int codec_mpeg4_can_recycle(struct amvdec_core *core)
++{
++	return !amvdec_read_dos(core, MREG_BUFFERIN);
++}
++
++static void codec_mpeg4_recycle(struct amvdec_core *core, u32 buf_idx)
++{
++	amvdec_write_dos(core, MREG_BUFFERIN, ~BIT(buf_idx));
++}
++
++static int codec_mpeg4_start(struct amvdec_session *sess) {
++	struct amvdec_core *core = sess->core;
++	struct codec_mpeg4 *mpeg4 = sess->priv;
++	int ret;
++
++	mpeg4 = kzalloc(sizeof(*mpeg4), GFP_KERNEL);
++	if (!mpeg4)
++		return -ENOMEM;
++
++	/* Allocate some memory for the MPEG4 decoder's state */
++	mpeg4->workspace_vaddr = dma_alloc_coherent(core->dev, SIZE_WORKSPACE,
++						    &mpeg4->workspace_paddr,
++						    GFP_KERNEL);
++	if (!mpeg4->workspace_vaddr) {
++		dev_err(core->dev, "Failed to request MPEG4 Workspace\n");
++		ret = -ENOMEM;
++		goto free_mpeg4;
++	}
++
++	/* Canvas regs: AV_SCRATCH_0-AV_SCRATCH_4;AV_SCRATCH_G-AV_SCRATCH_J */
++	amvdec_set_canvases(sess, (u32[]){ AV_SCRATCH_0, AV_SCRATCH_G, 0 },
++				  (u32[]){ 4, 4, 0 });
++
++	amvdec_write_dos(core, MEM_OFFSET_REG,
++			 mpeg4->workspace_paddr - DCAC_BUFF_START_IP);
++	amvdec_write_dos(core, PSCALE_CTRL, 0);
++	amvdec_write_dos(core, MP4_NOT_CODED_CNT, 0);
++	amvdec_write_dos(core, MREG_BUFFERIN, 0);
++	amvdec_write_dos(core, MREG_BUFFEROUT, 0);
++	amvdec_write_dos(core, MREG_FATAL_ERROR, 0);
++	amvdec_write_dos(core, MDEC_PIC_DC_THRESH, 0x404038aa);
++
++	sess->keyframe_found = 1;
++	sess->priv = mpeg4;
++
++	return 0;
++
++free_mpeg4:
++	kfree(mpeg4);
++	return ret;
++}
++
++static int codec_mpeg4_stop(struct amvdec_session *sess)
++{
++	struct codec_mpeg4 *mpeg4 = sess->priv;
++	struct amvdec_core *core = sess->core;
++
++	if (mpeg4->workspace_vaddr) {
++		dma_free_coherent(core->dev, SIZE_WORKSPACE,
++				  mpeg4->workspace_vaddr,
++				  mpeg4->workspace_paddr);
++		mpeg4->workspace_vaddr = 0;
++	}
++
++	return 0;
++}
++
++static irqreturn_t codec_mpeg4_isr(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	u32 reg;
++	u32 buffer_index;
++	u32 field = V4L2_FIELD_NONE;
++
++	reg = amvdec_read_dos(core, MREG_FATAL_ERROR);
++	if (reg == 1) {
++		dev_err(core->dev, "mpeg4 fatal error\n");
++		amvdec_abort(sess);
++		return IRQ_HANDLED;
++	}
++
++	reg = amvdec_read_dos(core, MREG_BUFFEROUT);
++	if (!reg)
++		goto end;
++
++	buffer_index = reg & BUF_IDX_MASK;
++	if (reg & INTERLACE_FLAG)
++		field = (reg & TOP_FIELD_FIRST_FLAG) ?
++			V4L2_FIELD_INTERLACED_TB :
++			V4L2_FIELD_INTERLACED_BT;
++
++	amvdec_dst_buf_done_idx(sess, buffer_index, -1, field);
++	amvdec_write_dos(core, MREG_BUFFEROUT, 0);
++
++end:
++	amvdec_write_dos(core, ASSIST_MBOX1_CLR_REG, 1);
++	return IRQ_HANDLED;
++}
++
++struct amvdec_codec_ops codec_mpeg4_ops = {
++	.start = codec_mpeg4_start,
++	.stop = codec_mpeg4_stop,
++	.isr = codec_mpeg4_isr,
++	.can_recycle = codec_mpeg4_can_recycle,
++	.recycle = codec_mpeg4_recycle,
++};
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg4.h b/drivers/staging/media/meson/vdec/codec_mpeg4.h
+new file mode 100644
+index 0000000000000..b91b264131854
+--- /dev/null
++++ b/drivers/staging/media/meson/vdec/codec_mpeg4.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (C) 2018 Maxime Jourdan <maxi.jourdan@wanadoo.fr>
++ */
++
++#ifndef __MESON_VDEC_CODEC_MPEG4_H_
++#define __MESON_VDEC_CODEC_MPEG4_H_
++
++#include "vdec.h"
++
++extern struct amvdec_codec_ops codec_mpeg4_ops;
++
++#endif
+\ No newline at end of file
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+index 579d3e48f0b29..be307bf5bccdf 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -10,9 +10,40 @@
+ #include "vdec_1.h"
+ #include "codec_mpeg12.h"
+ #include "codec_h264.h"
++#include "codec_mpeg4.h"
+ 
+ static const struct amvdec_format vdec_formats_gxbb[] = {
+ 	{
++		.pixfmt = V4L2_PIX_FMT_MPEG4,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/vmpeg4_mc_5",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
++		.pixfmt = V4L2_PIX_FMT_H263,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/h263_mc",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
++		.pixfmt = V4L2_PIX_FMT_XVID,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/vmpeg4_mc_5",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
+ 		.pixfmt = V4L2_PIX_FMT_H264,
+ 		.min_buffers = 2,
+ 		.max_buffers = 24,
+@@ -47,6 +78,36 @@ static const struct amvdec_format vdec_formats_gxbb[] = {
+ 
+ static const struct amvdec_format vdec_formats_gxl[] = {
+ 	{
++		.pixfmt = V4L2_PIX_FMT_MPEG4,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/vmpeg4_mc_5",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
++		.pixfmt = V4L2_PIX_FMT_H263,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/h263_mc",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
++		.pixfmt = V4L2_PIX_FMT_XVID,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/vmpeg4_mc_5",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
+ 		.pixfmt = V4L2_PIX_FMT_H264,
+ 		.min_buffers = 2,
+ 		.max_buffers = 24,
+@@ -81,6 +142,36 @@ static const struct amvdec_format vdec_formats_gxl[] = {
+ 
+ static const struct amvdec_format vdec_formats_gxm[] = {
+ 	{
++		.pixfmt = V4L2_PIX_FMT_MPEG4,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/vmpeg4_mc_5",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
++		.pixfmt = V4L2_PIX_FMT_H263,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/h263_mc",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
++		.pixfmt = V4L2_PIX_FMT_XVID,
++		.min_buffers = 8,
++		.max_buffers = 8,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_mpeg4_ops,
++		.firmware_path = "meson/gx/vmpeg4_mc_5",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_YUV420M, 0 },
++	}, {
+ 		.pixfmt = V4L2_PIX_FMT_H264,
+ 		.min_buffers = 2,
+ 		.max_buffers = 24,
+-- 
+2.24.0
+
+
+From c4b072ae72695532d55e3a715456a9f7c9db4b67 Mon Sep 17 00:00:00 2001
+From: Maxime Jourdan <mjourdan@baylibre.com>
+Date: Sun, 21 Oct 2018 15:14:49 +0200
+Subject: [PATCH 03/12] WIP: media: videodev2.h: Add Amlogic compressed format
+
+Add V4L2_PIX_FMT_AM21C which is a lossless, compressed framebuffer
+format.
+
+It is used by the video decoding and the display IP on many Amlogic
+SoCs.
+---
+ drivers/media/v4l2-core/v4l2-ioctl.c | 1 +
+ include/uapi/linux/videodev2.h       | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+index 4e700583659ba..806ab26cb09c6 100644
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -1390,6 +1390,7 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
+ 		case V4L2_PIX_FMT_S5C_UYVY_JPG:	descr = "S5C73MX interleaved UYVY/JPEG"; break;
+ 		case V4L2_PIX_FMT_MT21C:	descr = "Mediatek Compressed Format"; break;
+ 		case V4L2_PIX_FMT_SUNXI_TILED_NV12: descr = "Sunxi Tiled NV12 Format"; break;
++		case V4L2_PIX_FMT_AM21C:	descr = "Amlogic Compressed Format"; break;
+ 		default:
+ 			if (fmt->description[0])
+ 				return;
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 04481c717fee7..6026feb48057d 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -729,6 +729,7 @@ struct v4l2_pix_format {
+ #define V4L2_PIX_FMT_Y12I     v4l2_fourcc('Y', '1', '2', 'I') /* Greyscale 12-bit L/R interleaved */
+ #define V4L2_PIX_FMT_Z16      v4l2_fourcc('Z', '1', '6', ' ') /* Depth data 16-bit */
+ #define V4L2_PIX_FMT_MT21C    v4l2_fourcc('M', 'T', '2', '1') /* Mediatek compressed block mode  */
++#define V4L2_PIX_FMT_AM21C    v4l2_fourcc('A', 'M', '2', '1') /* Amlogic compressed block mode  */
+ #define V4L2_PIX_FMT_INZI     v4l2_fourcc('I', 'N', 'Z', 'I') /* Intel Planar Greyscale 10-bit and Depth 16-bit */
+ #define V4L2_PIX_FMT_SUNXI_TILED_NV12 v4l2_fourcc('S', 'T', '1', '2') /* Sunxi Tiled NV12 Format */
+ #define V4L2_PIX_FMT_CNF4     v4l2_fourcc('C', 'N', 'F', '4') /* Intel 4-bit packed depth confidence information */
+-- 
+2.24.0
+
+
+From 89ac4882dce3ee057b47ed3e496c3842da4875df Mon Sep 17 00:00:00 2001
+From: Maxime Jourdan <mjourdan@baylibre.com>
+Date: Sun, 21 Oct 2018 15:15:26 +0200
+Subject: [PATCH 04/12] WIP: media: meson: vdec: add support for
+ V4L2_PIX_FMT_AM21C
+
+Support the lossless framebuffer compression format.
+---
+ drivers/staging/media/meson/vdec/vdec.c       | 12 +++++++
+ .../staging/media/meson/vdec/vdec_helpers.c   | 31 +++++++++++++++++++
+ .../staging/media/meson/vdec/vdec_helpers.h   |  4 +++
+ 3 files changed, 47 insertions(+)
+
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 0a1a04fd5d13d..c3415db2b15bb 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -187,6 +187,7 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ {
+ 	struct amvdec_session *sess = vb2_get_drv_priv(q);
+ 	u32 output_size = amvdec_get_output_size(sess);
++	u32 am21c_size = amvdec_am21c_size(sess->width, sess->height);
+ 
+ 	if (*num_planes) {
+ 		switch (q->type) {
+@@ -209,6 +210,10 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ 				    sizes[2] < output_size / 4)
+ 					return -EINVAL;
+ 				break;
++			case V4L2_PIX_FMT_AM21C:
++				if (*num_planes != 1 || sizes[0] < am21c_size)
++					return -EINVAL;
++				break;
+ 			default:
+ 				return -EINVAL;
+ 			}
+@@ -238,6 +243,9 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ 			sizes[2] = output_size / 4;
+ 			*num_planes = 3;
+ 			break;
++		case V4L2_PIX_FMT_AM21C:
++			sizes[0] = am21c_size;
++			*num_planes = 1;
+ 		default:
+ 			return -EINVAL;
+ 		}
+@@ -518,6 +526,10 @@ vdec_try_fmt_common(struct amvdec_session *sess, u32 size,
+ 			      get_output_size(pixmp->width, pixmp->height) / 4;
+ 			pfmt[2].bytesperline = ALIGN(pixmp->width, 64) / 2;
+ 			pixmp->num_planes = 3;
++		} else if (pixmp->pixelformat == V4L2_PIX_FMT_AM21C) {
++			pfmt[0].sizeimage =
++				amvdec_am21c_size(pixmp->width, pixmp->height);
++			pfmt[0].bytesperline = 0;
+ 		}
+ 	} else {
+ 		return NULL;
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index f16948bdbf2f6..2b554f21e3c15 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -50,6 +50,33 @@ void amvdec_write_parser(struct amvdec_core *core, u32 reg, u32 val)
+ }
+ EXPORT_SYMBOL_GPL(amvdec_write_parser);
+ 
++/* 4 KiB per 64x32 block */
++u32 amvdec_am21c_body_size(u32 width, u32 height)
++{
++	u32 width_64 = ALIGN(width, 64) / 64;
++	u32 height_32 = ALIGN(height, 32) / 32;
++
++	return SZ_4K * width_64 * height_32;
++}
++EXPORT_SYMBOL_GPL(amvdec_am21c_body_size);
++
++/* 32 bytes per 128x64 block */
++u32 amvdec_am21c_head_size(u32 width, u32 height)
++{
++	u32 width_128 = ALIGN(width, 128) / 128;
++	u32 height_64 = ALIGN(height, 64) / 64;
++
++	return 32 * width_128 * height_64;
++}
++EXPORT_SYMBOL_GPL(amvdec_am21c_head_size);
++
++u32 amvdec_am21c_size(u32 width, u32 height)
++{
++	return ALIGN(amvdec_am21c_body_size(width, height) +
++		     amvdec_am21c_head_size(width, height), SZ_64K);
++}
++EXPORT_SYMBOL_GPL(amvdec_am21c_size);
++
+ static int canvas_alloc(struct amvdec_session *sess, u8 *canvas_id)
+ {
+ 	int ret;
+@@ -267,6 +294,10 @@ static void dst_buf_done(struct amvdec_session *sess,
+ 		vbuf->vb2_buf.planes[1].bytesused = output_size / 4;
+ 		vbuf->vb2_buf.planes[2].bytesused = output_size / 4;
+ 		break;
++	case V4L2_PIX_FMT_AM21C:
++		vbuf->vb2_buf.planes[0].bytesused =
++			amvdec_am21c_size(sess->width, sess->height);
++		break;
+ 	}
+ 
+ 	vbuf->vb2_buf.timestamp = timestamp;
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.h b/drivers/staging/media/meson/vdec/vdec_helpers.h
+index a455a9ee1cc27..94d2c1ecfe149 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h
+@@ -27,6 +27,10 @@ void amvdec_clear_dos_bits(struct amvdec_core *core, u32 reg, u32 val);
+ u32 amvdec_read_parser(struct amvdec_core *core, u32 reg);
+ void amvdec_write_parser(struct amvdec_core *core, u32 reg, u32 val);
+ 
++u32 amvdec_am21c_body_size(u32 width, u32 height);
++u32 amvdec_am21c_head_size(u32 width, u32 height);
++u32 amvdec_am21c_size(u32 width, u32 height);
++
+ /**
+  * amvdec_dst_buf_done_idx() - Signal that a buffer is done decoding
+  *
+-- 
+2.24.0
+
+
+From 5d4289bfe51ea88561e9b1a3f89b0df70f664631 Mon Sep 17 00:00:00 2001
+From: Jerome Brunet <jbrunet@baylibre.com>
+Date: Thu, 30 Mar 2017 11:49:55 +0200
+Subject: [PATCH 05/12] ASoC: meson: add meson audio core driver
+
+This patch adds support for the audio core driver for the Amlogic Meson SoC
+family. The purpose of this driver is to properly reset the audio block and
+provide register access for the different devices scattered in this address
+space. This includes output and input DMAs, pcm, i2s and spdif dai, card
+level routing, internal codec for the gxl variant
+
+For more information, please refer to the section 5 of the public datasheet
+of the S905 (gxbb). This datasheet is available here: [0].
+
+[0]: http://dn.odroid.com/S905/DataSheet/S905_Public_Datasheet_V1.1.4.pdf
+
+Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+---
+ sound/soc/Kconfig               |   1 +
+ sound/soc/Makefile              |   1 +
+ sound/soc/meson-gx/Kconfig      |  11 ++
+ sound/soc/meson-gx/Makefile     |   3 +
+ sound/soc/meson-gx/audio-core.c | 180 ++++++++++++++++++++++++++++++++
+ sound/soc/meson-gx/audio-core.h |  28 +++++
+ 6 files changed, 224 insertions(+)
+ create mode 100644 sound/soc/meson-gx/Kconfig
+ create mode 100644 sound/soc/meson-gx/Makefile
+ create mode 100644 sound/soc/meson-gx/audio-core.c
+ create mode 100644 sound/soc/meson-gx/audio-core.h
+
+diff --git a/sound/soc/Kconfig b/sound/soc/Kconfig
+index bdc305cece6eb..19bef1d501909 100644
+--- a/sound/soc/Kconfig
++++ b/sound/soc/Kconfig
+@@ -56,6 +56,7 @@ source "sound/soc/img/Kconfig"
+ source "sound/soc/intel/Kconfig"
+ source "sound/soc/mediatek/Kconfig"
+ source "sound/soc/meson/Kconfig"
++source "sound/soc/meson-gx/Kconfig"
+ source "sound/soc/mxs/Kconfig"
+ source "sound/soc/pxa/Kconfig"
+ source "sound/soc/qcom/Kconfig"
+diff --git a/sound/soc/Makefile b/sound/soc/Makefile
+index 861a21b794844..af539268054fd 100644
+--- a/sound/soc/Makefile
++++ b/sound/soc/Makefile
+@@ -38,6 +38,7 @@ obj-$(CONFIG_SND_SOC)	+= img/
+ obj-$(CONFIG_SND_SOC)	+= intel/
+ obj-$(CONFIG_SND_SOC)	+= mediatek/
+ obj-$(CONFIG_SND_SOC)	+= meson/
++obj-$(CONFIG_SND_SOC)	+= meson-gx/
+ obj-$(CONFIG_SND_SOC)	+= mxs/
+ obj-$(CONFIG_SND_SOC)	+= kirkwood/
+ obj-$(CONFIG_SND_SOC)	+= pxa/
+diff --git a/sound/soc/meson-gx/Kconfig b/sound/soc/meson-gx/Kconfig
+new file mode 100644
+index 0000000000000..280e49e7c16fe
+--- /dev/null
++++ b/sound/soc/meson-gx/Kconfig
+@@ -0,0 +1,11 @@
++menuconfig SND_SOC_MESON_GX
++	tristate "ASoC WIP support for Amlogic GX SoCs"
++	depends on ARCH_MESON
++	select MFD_CORE
++	select REGMAP_MMIO
++	help
++	  Say Y or M if you want to add support for codecs attached to
++	  the Amlogic Meson SoCs Audio interfaces. You will also need to
++	  select the audio interfaces to support below. This WIP drivers
++	  are kept separated from the actual upstream amlogic ASoC driver
++	  to minimize conflicts until support is submitted and merged
+diff --git a/sound/soc/meson-gx/Makefile b/sound/soc/meson-gx/Makefile
+new file mode 100644
+index 0000000000000..6f124c31a85cc
+--- /dev/null
++++ b/sound/soc/meson-gx/Makefile
+@@ -0,0 +1,3 @@
++snd-soc-meson-audio-core-objs	 := audio-core.o
++
++obj-$(CONFIG_SND_SOC_MESON_GX)		+= snd-soc-meson-audio-core.o
+diff --git a/sound/soc/meson-gx/audio-core.c b/sound/soc/meson-gx/audio-core.c
+new file mode 100644
+index 0000000000000..68f7e0e58f5f2
+--- /dev/null
++++ b/sound/soc/meson-gx/audio-core.c
+@@ -0,0 +1,180 @@
++/*
++ * Copyright (C) 2017 BayLibre, SAS
++ * Author: Jerome Brunet <jbrunet@baylibre.com>
++ * Copyright (C) 2017 Amlogic, Inc. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <linux/clk.h>
++#include <linux/mfd/core.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++
++#include "audio-core.h"
++
++#define DRV_NAME "meson-gx-audio-core"
++
++static const char * const acore_clock_names[] = { "aiu_top",
++						  "aiu_glue",
++						  "audin" };
++
++static int meson_acore_init_clocks(struct device *dev)
++{
++	struct clk *clock;
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(acore_clock_names); i++) {
++		clock = devm_clk_get(dev, acore_clock_names[i]);
++		if (IS_ERR(clock)) {
++			if (PTR_ERR(clock) != -EPROBE_DEFER)
++				dev_err(dev, "Failed to get %s clock\n",
++					acore_clock_names[i]);
++			return PTR_ERR(clock);
++		}
++
++		ret = clk_prepare_enable(clock);
++		if (ret) {
++			dev_err(dev, "Failed to enable %s clock\n",
++				acore_clock_names[i]);
++			return ret;
++		}
++
++		ret = devm_add_action_or_reset(dev,
++				(void(*)(void *))clk_disable_unprepare,
++				clock);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static const char * const acore_reset_names[] = { "aiu",
++						  "audin" };
++
++static int meson_acore_init_resets(struct device *dev)
++{
++	struct reset_control *reset;
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(acore_reset_names); i++) {
++		reset = devm_reset_control_get_exclusive(dev,
++							 acore_reset_names[i]);
++		if (IS_ERR(reset)) {
++			if (PTR_ERR(reset) != -EPROBE_DEFER)
++				dev_err(dev, "Failed to get %s reset\n",
++					acore_reset_names[i]);
++			return PTR_ERR(reset);
++		}
++
++		ret = reset_control_reset(reset);
++		if (ret) {
++			dev_err(dev, "Failed to pulse %s reset\n",
++				acore_reset_names[i]);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static const struct regmap_config meson_acore_regmap_config = {
++	.reg_bits       = 32,
++	.val_bits       = 32,
++	.reg_stride     = 4,
++};
++
++static const struct mfd_cell meson_acore_devs[] = {
++	{
++		.name = "meson-aiu-i2s",
++		.of_compatible = "amlogic,meson-aiu-i2s",
++	},
++	{
++		.name = "meson-aiu-spdif",
++		.of_compatible = "amlogic,meson-aiu-spdif",
++	},
++};
++
++static int meson_acore_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct meson_audio_core_data *data;
++	struct resource *res;
++	void __iomem *regs;
++	int ret;
++
++	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++	platform_set_drvdata(pdev, data);
++
++	ret = meson_acore_init_clocks(dev);
++	if (ret)
++		return ret;
++
++	ret = meson_acore_init_resets(dev);
++	if (ret)
++		return ret;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "aiu");
++	regs = devm_ioremap_resource(dev, res);
++	if (IS_ERR(regs))
++		return PTR_ERR(regs);
++
++	data->aiu = devm_regmap_init_mmio(dev, regs,
++					  &meson_acore_regmap_config);
++	if (IS_ERR(data->aiu)) {
++		dev_err(dev, "Couldn't create the AIU regmap\n");
++		return PTR_ERR(data->aiu);
++	}
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "audin");
++	regs = devm_ioremap_resource(dev, res);
++	if (IS_ERR(regs))
++		return PTR_ERR(regs);
++
++	data->audin = devm_regmap_init_mmio(dev, regs,
++					    &meson_acore_regmap_config);
++	if (IS_ERR(data->audin)) {
++		dev_err(dev, "Couldn't create the AUDIN regmap\n");
++		return PTR_ERR(data->audin);
++	}
++
++	return devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO, meson_acore_devs,
++				    ARRAY_SIZE(meson_acore_devs), NULL, 0,
++				    NULL);
++}
++
++static const struct of_device_id meson_acore_of_match[] = {
++	{ .compatible = "amlogic,meson-gx-audio-core", },
++	{}
++};
++MODULE_DEVICE_TABLE(of, meson_acore_of_match);
++
++static struct platform_driver meson_acore_pdrv = {
++	.probe = meson_acore_probe,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = meson_acore_of_match,
++	},
++};
++module_platform_driver(meson_acore_pdrv);
++
++MODULE_DESCRIPTION("Meson Audio Core Driver");
++MODULE_AUTHOR("Jerome Brunet <jbrunet@baylibre.com>");
++MODULE_LICENSE("GPL v2");
+diff --git a/sound/soc/meson-gx/audio-core.h b/sound/soc/meson-gx/audio-core.h
+new file mode 100644
+index 0000000000000..6e7a24cdc4a96
+--- /dev/null
++++ b/sound/soc/meson-gx/audio-core.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright (C) 2017 BayLibre, SAS
++ * Author: Jerome Brunet <jbrunet@baylibre.com>
++ * Copyright (C) 2017 Amlogic, Inc. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _MESON_AUDIO_CORE_H_
++#define _MESON_AUDIO_CORE_H_
++
++struct meson_audio_core_data {
++	struct regmap *aiu;
++	struct regmap *audin;
++};
++
++#endif /* _MESON_AUDIO_CORE_H_ */
+-- 
+2.24.0
+
+
+From 6ed8871497e1f73d49250925fd18becb9a4cc088 Mon Sep 17 00:00:00 2001
+From: Jerome Brunet <jbrunet@baylibre.com>
+Date: Thu, 30 Mar 2017 12:00:10 +0200
+Subject: [PATCH 06/12] ASoC: meson: add register definitions
+
+Add the register definition for the AIU and AUDIN blocks
+
+Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+---
+ sound/soc/meson-gx/aiu-regs.h   | 182 ++++++++++++++++++++++++++++++++
+ sound/soc/meson-gx/audin-regs.h | 148 ++++++++++++++++++++++++++
+ 2 files changed, 330 insertions(+)
+ create mode 100644 sound/soc/meson-gx/aiu-regs.h
+ create mode 100644 sound/soc/meson-gx/audin-regs.h
+
+diff --git a/sound/soc/meson-gx/aiu-regs.h b/sound/soc/meson-gx/aiu-regs.h
+new file mode 100644
+index 0000000000000..67391e64fe1c2
+--- /dev/null
++++ b/sound/soc/meson-gx/aiu-regs.h
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (C) 2017 BayLibre, SAS
++ * Author: Jerome Brunet <jbrunet@baylibre.com>
++ * Copyright (C) 2017 Amlogic, Inc. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _AIU_REGS_H_
++#define _AIU_REGS_H_
++
++#define AIU_958_BPF			0x000
++#define AIU_958_BRST			0x004
++#define AIU_958_LENGTH			0x008
++#define AIU_958_PADDSIZE		0x00C
++#define AIU_958_MISC			0x010
++#define AIU_958_FORCE_LEFT		0x014	/* Unknown */
++#define AIU_958_DISCARD_NUM		0x018
++#define AIU_958_DCU_FF_CTRL		0x01C
++#define AIU_958_CHSTAT_L0		0x020
++#define AIU_958_CHSTAT_L1		0x024
++#define AIU_958_CTRL			0x028
++#define AIU_958_RPT			0x02C
++#define AIU_I2S_MUTE_SWAP		0x030
++#define AIU_I2S_SOURCE_DESC		0x034
++#define AIU_I2S_MED_CTRL		0x038
++#define AIU_I2S_MED_THRESH		0x03C
++#define AIU_I2S_DAC_CFG			0x040
++#define AIU_I2S_SYNC			0x044	/* Unknown */
++#define AIU_I2S_MISC			0x048
++#define AIU_I2S_OUT_CFG			0x04C
++#define AIU_I2S_FF_CTRL			0x050	/* Unknown */
++#define AIU_RST_SOFT			0x054
++#define AIU_CLK_CTRL			0x058
++#define AIU_MIX_ADCCFG			0x05C
++#define AIU_MIX_CTRL			0x060
++#define AIU_CLK_CTRL_MORE		0x064
++#define AIU_958_POP			0x068
++#define AIU_MIX_GAIN			0x06C
++#define AIU_958_SYNWORD1		0x070
++#define AIU_958_SYNWORD2		0x074
++#define AIU_958_SYNWORD3		0x078
++#define AIU_958_SYNWORD1_MASK		0x07C
++#define AIU_958_SYNWORD2_MASK		0x080
++#define AIU_958_SYNWORD3_MASK		0x084
++#define AIU_958_FFRDOUT_THD		0x088
++#define AIU_958_LENGTH_PER_PAUSE	0x08C
++#define AIU_958_PAUSE_NUM		0x090
++#define AIU_958_PAUSE_PAYLOAD		0x094
++#define AIU_958_AUTO_PAUSE		0x098
++#define AIU_958_PAUSE_PD_LENGTH		0x09C
++#define AIU_CODEC_DAC_LRCLK_CTRL	0x0A0
++#define AIU_CODEC_ADC_LRCLK_CTRL	0x0A4
++#define AIU_HDMI_CLK_DATA_CTRL		0x0A8
++#define AIU_CODEC_CLK_DATA_CTRL		0x0AC
++#define AIU_ACODEC_CTRL			0x0B0
++#define AIU_958_CHSTAT_R0		0x0C0
++#define AIU_958_CHSTAT_R1		0x0C4
++#define AIU_958_VALID_CTRL		0x0C8
++#define AIU_AUDIO_AMP_REG0		0x0F0	/* Unknown */
++#define AIU_AUDIO_AMP_REG1		0x0F4	/* Unknown */
++#define AIU_AUDIO_AMP_REG2		0x0F8	/* Unknown */
++#define AIU_AUDIO_AMP_REG3		0x0FC	/* Unknown */
++#define AIU_AIFIFO2_CTRL		0x100
++#define AIU_AIFIFO2_STATUS		0x104
++#define AIU_AIFIFO2_GBIT		0x108
++#define AIU_AIFIFO2_CLB			0x10C
++#define AIU_CRC_CTRL			0x110
++#define AIU_CRC_STATUS			0x114
++#define AIU_CRC_SHIFT_REG		0x118
++#define AIU_CRC_IREG			0x11C
++#define AIU_CRC_CAL_REG1		0x120
++#define AIU_CRC_CAL_REG0		0x124
++#define AIU_CRC_POLY_COEF1		0x128
++#define AIU_CRC_POLY_COEF0		0x12C
++#define AIU_CRC_BIT_SIZE1		0x130
++#define AIU_CRC_BIT_SIZE0		0x134
++#define AIU_CRC_BIT_CNT1		0x138
++#define AIU_CRC_BIT_CNT0		0x13C
++#define AIU_AMCLK_GATE_HI		0x140
++#define AIU_AMCLK_GATE_LO		0x144
++#define AIU_AMCLK_MSR			0x148
++#define AIU_AUDAC_CTRL0			0x14C	/* Unknown */
++#define AIU_DELTA_SIGMA0		0x154	/* Unknown */
++#define AIU_DELTA_SIGMA1		0x158	/* Unknown */
++#define AIU_DELTA_SIGMA2		0x15C	/* Unknown */
++#define AIU_DELTA_SIGMA3		0x160	/* Unknown */
++#define AIU_DELTA_SIGMA4		0x164	/* Unknown */
++#define AIU_DELTA_SIGMA5		0x168	/* Unknown */
++#define AIU_DELTA_SIGMA6		0x16C	/* Unknown */
++#define AIU_DELTA_SIGMA7		0x170	/* Unknown */
++#define AIU_DELTA_SIGMA_LCNTS		0x174	/* Unknown */
++#define AIU_DELTA_SIGMA_RCNTS		0x178	/* Unknown */
++#define AIU_MEM_I2S_START_PTR		0x180
++#define AIU_MEM_I2S_RD_PTR		0x184
++#define AIU_MEM_I2S_END_PTR		0x188
++#define AIU_MEM_I2S_MASKS		0x18C
++#define AIU_MEM_I2S_CONTROL		0x190
++#define AIU_MEM_IEC958_START_PTR	0x194
++#define AIU_MEM_IEC958_RD_PTR		0x198
++#define AIU_MEM_IEC958_END_PTR		0x19C
++#define AIU_MEM_IEC958_MASKS		0x1A0
++#define AIU_MEM_IEC958_CONTROL		0x1A4
++#define AIU_MEM_AIFIFO2_START_PTR	0x1A8
++#define AIU_MEM_AIFIFO2_CURR_PTR	0x1AC
++#define AIU_MEM_AIFIFO2_END_PTR		0x1B0
++#define AIU_MEM_AIFIFO2_BYTES_AVAIL	0x1B4
++#define AIU_MEM_AIFIFO2_CONTROL		0x1B8
++#define AIU_MEM_AIFIFO2_MAN_WP		0x1BC
++#define AIU_MEM_AIFIFO2_MAN_RP		0x1C0
++#define AIU_MEM_AIFIFO2_LEVEL		0x1C4
++#define AIU_MEM_AIFIFO2_BUF_CNTL	0x1C8
++#define AIU_MEM_I2S_MAN_WP		0x1CC
++#define AIU_MEM_I2S_MAN_RP		0x1D0
++#define AIU_MEM_I2S_LEVEL		0x1D4
++#define AIU_MEM_I2S_BUF_CNTL		0x1D8
++#define AIU_MEM_I2S_BUF_WRAP_COUNT	0x1DC
++#define AIU_MEM_I2S_MEM_CTL		0x1E0
++#define AIU_MEM_IEC958_MEM_CTL		0x1E4
++#define AIU_MEM_IEC958_WRAP_COUNT	0x1E8
++#define AIU_MEM_IEC958_IRQ_LEVEL	0x1EC
++#define AIU_MEM_IEC958_MAN_WP		0x1F0
++#define AIU_MEM_IEC958_MAN_RP		0x1F4
++#define AIU_MEM_IEC958_LEVEL		0x1F8
++#define AIU_MEM_IEC958_BUF_CNTL		0x1FC
++#define AIU_AIFIFO_CTRL			0x200
++#define AIU_AIFIFO_STATUS		0x204
++#define AIU_AIFIFO_GBIT			0x208
++#define AIU_AIFIFO_CLB			0x20C
++#define AIU_MEM_AIFIFO_START_PTR	0x210
++#define AIU_MEM_AIFIFO_CURR_PTR		0x214
++#define AIU_MEM_AIFIFO_END_PTR		0x218
++#define AIU_MEM_AIFIFO_BYTES_AVAIL	0x21C
++#define AIU_MEM_AIFIFO_CONTROL		0x220
++#define AIU_MEM_AIFIFO_MAN_WP		0x224
++#define AIU_MEM_AIFIFO_MAN_RP		0x228
++#define AIU_MEM_AIFIFO_LEVEL		0x22C
++#define AIU_MEM_AIFIFO_BUF_CNTL		0x230
++#define AIU_MEM_AIFIFO_BUF_WRAP_COUNT	0x234
++#define AIU_MEM_AIFIFO2_BUF_WRAP_COUNT	0x238
++#define AIU_MEM_AIFIFO_MEM_CTL		0x23C
++#define AIFIFO_TIME_STAMP_CNTL		0x240
++#define AIFIFO_TIME_STAMP_SYNC_0	0x244
++#define AIFIFO_TIME_STAMP_SYNC_1	0x248
++#define AIFIFO_TIME_STAMP_0		0x24C
++#define AIFIFO_TIME_STAMP_1		0x250
++#define AIFIFO_TIME_STAMP_2		0x254
++#define AIFIFO_TIME_STAMP_3		0x258
++#define AIFIFO_TIME_STAMP_LENGTH	0x25C
++#define AIFIFO2_TIME_STAMP_CNTL		0x260
++#define AIFIFO2_TIME_STAMP_SYNC_0	0x264
++#define AIFIFO2_TIME_STAMP_SYNC_1	0x268
++#define AIFIFO2_TIME_STAMP_0		0x26C
++#define AIFIFO2_TIME_STAMP_1		0x270
++#define AIFIFO2_TIME_STAMP_2		0x274
++#define AIFIFO2_TIME_STAMP_3		0x278
++#define AIFIFO2_TIME_STAMP_LENGTH	0x27C
++#define IEC958_TIME_STAMP_CNTL		0x280
++#define IEC958_TIME_STAMP_SYNC_0	0x284
++#define IEC958_TIME_STAMP_SYNC_1	0x288
++#define IEC958_TIME_STAMP_0		0x28C
++#define IEC958_TIME_STAMP_1		0x290
++#define IEC958_TIME_STAMP_2		0x294
++#define IEC958_TIME_STAMP_3		0x298
++#define IEC958_TIME_STAMP_LENGTH	0x29C
++#define AIU_MEM_AIFIFO2_MEM_CTL		0x2A0
++#define AIU_I2S_CBUS_DDR_CNTL		0x2A4
++#define AIU_I2S_CBUS_DDR_WDATA		0x2A8
++#define AIU_I2S_CBUS_DDR_ADDR		0x2AC
++
++#endif /* _AIU_REGS_H_ */
+diff --git a/sound/soc/meson-gx/audin-regs.h b/sound/soc/meson-gx/audin-regs.h
+new file mode 100644
+index 0000000000000..f224610e80e73
+--- /dev/null
++++ b/sound/soc/meson-gx/audin-regs.h
+@@ -0,0 +1,148 @@
++/*
++ * Copyright (C) 2017 BayLibre, SAS
++ * Author: Jerome Brunet <jbrunet@baylibre.com>
++ * Copyright (C) 2017 Amlogic, Inc. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _AUDIN_REGS_H_
++#define _AUDIN_REGS_H_
++
++/*
++ * Note :
++ * Datasheet issue page 196
++ * AUDIN_MUTE_VAL 0x35 => impossible: Already assigned to AUDIN_FIFO1_PTR
++ * AUDIN_FIFO1_PTR is more likely to be correct here since surrounding registers
++ * also deal with AUDIN_FIFO1
++ *
++ * Clarification needed from Amlogic
++ */
++
++#define AUDIN_SPDIF_MODE		0x000
++#define AUDIN_SPDIF_FS_CLK_RLTN		0x004
++#define AUDIN_SPDIF_CHNL_STS_A		0x008
++#define AUDIN_SPDIF_CHNL_STS_B		0x00C
++#define AUDIN_SPDIF_MISC		0x010
++#define AUDIN_SPDIF_NPCM_PCPD		0x014
++#define AUDIN_SPDIF_END			0x03C	/* Unknown */
++#define AUDIN_I2SIN_CTRL		0x040
++#define AUDIN_SOURCE_SEL		0x044
++#define AUDIN_DECODE_FORMAT		0x048
++#define AUDIN_DECODE_CONTROL_STATUS	0x04C
++#define AUDIN_DECODE_CHANNEL_STATUS_A_0	0x050
++#define AUDIN_DECODE_CHANNEL_STATUS_A_1	0x054
++#define AUDIN_DECODE_CHANNEL_STATUS_A_2	0x058
++#define AUDIN_DECODE_CHANNEL_STATUS_A_3	0x05C
++#define AUDIN_DECODE_CHANNEL_STATUS_A_4	0x060
++#define AUDIN_DECODE_CHANNEL_STATUS_A_5	0x064
++#define AUDIN_FIFO0_START		0x080
++#define AUDIN_FIFO0_END			0x084
++#define AUDIN_FIFO0_PTR			0x088
++#define AUDIN_FIFO0_INTR		0x08C
++#define AUDIN_FIFO0_RDPTR		0x090
++#define AUDIN_FIFO0_CTRL		0x094
++#define AUDIN_FIFO0_CTRL1		0x098
++#define AUDIN_FIFO0_LVL0		0x09C
++#define AUDIN_FIFO0_LVL1		0x0A0
++#define AUDIN_FIFO0_LVL2		0x0A4
++#define AUDIN_FIFO0_REQID		0x0C0
++#define AUDIN_FIFO0_WRAP		0x0C4
++#define AUDIN_FIFO1_START		0x0CC
++#define AUDIN_FIFO1_END			0x0D0
++#define AUDIN_FIFO1_PTR			0x0D4
++#define AUDIN_FIFO1_INTR		0x0D8
++#define AUDIN_FIFO1_RDPTR		0x0DC
++#define AUDIN_FIFO1_CTRL		0x0E0
++#define AUDIN_FIFO1_CTRL1		0x0E4
++#define AUDIN_FIFO1_LVL0		0x100
++#define AUDIN_FIFO1_LVL1		0x104
++#define AUDIN_FIFO1_LVL2		0x108
++#define AUDIN_FIFO1_REQID		0x10C
++#define AUDIN_FIFO1_WRAP		0x110
++#define AUDIN_FIFO2_START		0x114
++#define AUDIN_FIFO2_END			0x118
++#define AUDIN_FIFO2_PTR			0x11C
++#define AUDIN_FIFO2_INTR		0x120
++#define AUDIN_FIFO2_RDPTR		0x124
++#define AUDIN_FIFO2_CTRL		0x128
++#define AUDIN_FIFO2_CTRL1		0x12C
++#define AUDIN_FIFO2_LVL0		0x130
++#define AUDIN_FIFO2_LVL1		0x134
++#define AUDIN_FIFO2_LVL2		0x138
++#define AUDIN_FIFO2_REQID		0x13C
++#define AUDIN_FIFO2_WRAP		0x140
++#define AUDIN_INT_CTRL			0x144
++#define AUDIN_FIFO_INT			0x148
++#define PCMIN_CTRL0			0x180
++#define PCMIN_CTRL1			0x184
++#define PCMIN1_CTRL0			0x188
++#define PCMIN1_CTRL1			0x18C
++#define PCMOUT_CTRL0			0x1C0
++#define PCMOUT_CTRL1			0x1C4
++#define PCMOUT_CTRL2			0x1C8
++#define PCMOUT_CTRL3			0x1CC
++#define PCMOUT1_CTRL0			0x1D0
++#define PCMOUT1_CTRL1			0x1D4
++#define PCMOUT1_CTRL2			0x1D8
++#define PCMOUT1_CTRL3			0x1DC
++#define AUDOUT_CTRL			0x200
++#define AUDOUT_CTRL1			0x204
++#define AUDOUT_BUF0_STA			0x208
++#define AUDOUT_BUF0_EDA			0x20C
++#define AUDOUT_BUF0_WPTR		0x210
++#define AUDOUT_BUF1_STA			0x214
++#define AUDOUT_BUF1_EDA			0x218
++#define AUDOUT_BUF1_WPTR		0x21C
++#define AUDOUT_FIFO_RPTR		0x220
++#define AUDOUT_INTR_PTR			0x224
++#define AUDOUT_FIFO_STS			0x228
++#define AUDOUT1_CTRL			0x240
++#define AUDOUT1_CTRL1			0x244
++#define AUDOUT1_BUF0_STA		0x248
++#define AUDOUT1_BUF0_EDA		0x24C
++#define AUDOUT1_BUF0_WPTR		0x250
++#define AUDOUT1_BUF1_STA		0x254
++#define AUDOUT1_BUF1_EDA		0x258
++#define AUDOUT1_BUF1_WPTR		0x25C
++#define AUDOUT1_FIFO_RPTR		0x260
++#define AUDOUT1_INTR_PTR		0x264
++#define AUDOUT1_FIFO_STS		0x268
++#define AUDIN_HDMI_MEAS_CTRL		0x280
++#define AUDIN_HDMI_MEAS_CYCLES_M1	0x284
++#define AUDIN_HDMI_MEAS_INTR_MASKN	0x288
++#define AUDIN_HDMI_MEAS_INTR_STAT	0x28C
++#define AUDIN_HDMI_REF_CYCLES_STAT_0	0x290
++#define AUDIN_HDMI_REF_CYCLES_STAT_1	0x294
++#define AUDIN_HDMIRX_AFIFO_STAT		0x298
++#define AUDIN_FIFO0_PIO_STS		0x2C0
++#define AUDIN_FIFO0_PIO_RDL		0x2C4
++#define AUDIN_FIFO0_PIO_RDH		0x2C8
++#define AUDIN_FIFO1_PIO_STS		0x2CC
++#define AUDIN_FIFO1_PIO_RDL		0x2D0
++#define AUDIN_FIFO1_PIO_RDH		0x2D4
++#define AUDIN_FIFO2_PIO_STS		0x2D8
++#define AUDIN_FIFO2_PIO_RDL		0x2DC
++#define AUDIN_FIFO2_PIO_RDH		0x2E0
++#define AUDOUT_FIFO_PIO_STS		0x2E4
++#define AUDOUT_FIFO_PIO_WRL		0x2E8
++#define AUDOUT_FIFO_PIO_WRH		0x2EC
++#define AUDOUT1_FIFO_PIO_STS		0x2F0	/* Unknown */
++#define AUDOUT1_FIFO_PIO_WRL		0x2F4	/* Unknown */
++#define AUDOUT1_FIFO_PIO_WRH		0x2F8	/* Unknown */
++#define AUD_RESAMPLE_CTRL0		0x2FC
++#define AUD_RESAMPLE_CTRL1		0x300
++#define AUD_RESAMPLE_STATUS		0x304
++
++#endif /* _AUDIN_REGS_H_ */
+-- 
+2.24.0
+
+
+From 4c26640c91fa3a1963f6bbdde5bddee300432849 Mon Sep 17 00:00:00 2001
+From: Jerome Brunet <jbrunet@baylibre.com>
+Date: Thu, 30 Mar 2017 12:17:27 +0200
+Subject: [PATCH 07/12] ASoC: meson: add initial aiu i2s support
+
+Add support for the aiu i2s found on Amlogic Meson SoC family.
+With this initial implementation, only playback is supported.
+Capture will be part of furture work.
+
+Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+---
+ sound/soc/meson-gx/Kconfig   |   8 +
+ sound/soc/meson-gx/Makefile  |   3 +
+ sound/soc/meson-gx/aiu-i2s.c | 749 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 760 insertions(+)
+ create mode 100644 sound/soc/meson-gx/aiu-i2s.c
+
+diff --git a/sound/soc/meson-gx/Kconfig b/sound/soc/meson-gx/Kconfig
+index 280e49e7c16fe..8ec683cdf3276 100644
+--- a/sound/soc/meson-gx/Kconfig
++++ b/sound/soc/meson-gx/Kconfig
+@@ -9,3 +9,11 @@ menuconfig SND_SOC_MESON_GX
+ 	  select the audio interfaces to support below. This WIP drivers
+ 	  are kept separated from the actual upstream amlogic ASoC driver
+ 	  to minimize conflicts until support is submitted and merged
++
++config SND_SOC_MESON_GX_I2S
++	tristate "Meson i2s interface"
++	depends on SND_SOC_MESON_GX
++	help
++	  Say Y or M if you want to add support for i2s driver for Amlogic
++	  Meson SoCs.
++
+diff --git a/sound/soc/meson-gx/Makefile b/sound/soc/meson-gx/Makefile
+index 6f124c31a85cc..02f9c4df6348d 100644
+--- a/sound/soc/meson-gx/Makefile
++++ b/sound/soc/meson-gx/Makefile
+@@ -1,3 +1,6 @@
+ snd-soc-meson-audio-core-objs	 := audio-core.o
++snd-soc-meson-aiu-i2s-objs	 := aiu-i2s.o
+ 
+ obj-$(CONFIG_SND_SOC_MESON_GX)		+= snd-soc-meson-audio-core.o
++obj-$(CONFIG_SND_SOC_MESON_GX_I2S)	+= snd-soc-meson-aiu-i2s.o
++
+diff --git a/sound/soc/meson-gx/aiu-i2s.c b/sound/soc/meson-gx/aiu-i2s.c
+new file mode 100644
+index 0000000000000..63d7821c2c72d
+--- /dev/null
++++ b/sound/soc/meson-gx/aiu-i2s.c
+@@ -0,0 +1,749 @@
++/*
++ * Copyright (C) 2017 BayLibre, SAS
++ * Author: Jerome Brunet <jbrunet@baylibre.com>
++ * Copyright (C) 2017 Amlogic, Inc. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <linux/clk.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/soc-dai.h>
++
++#include "aiu-regs.h"
++#include "audio-core.h"
++
++#define DRV_NAME "meson-aiu-i2s"
++
++struct meson_aiu_i2s {
++	struct meson_audio_core_data *core;
++	struct clk *mclk;
++	struct clk *bclks;
++	struct clk *iface;
++	struct clk *fast;
++	bool bclks_idle;
++	int irq;
++};
++
++#define AIU_MEM_I2S_BUF_CNTL_INIT		BIT(0)
++#define AIU_MEM_I2S_CONTROL_INIT		BIT(0)
++#define AIU_MEM_I2S_CONTROL_FILL_EN		BIT(1)
++#define AIU_MEM_I2S_CONTROL_EMPTY_EN		BIT(2)
++#define AIU_MEM_I2S_CONTROL_MODE_16BIT		BIT(6)
++#define AIU_MEM_I2S_CONTROL_BUSY		BIT(7)
++#define AIU_MEM_I2S_CONTROL_DATA_READY		BIT(8)
++#define AIU_MEM_I2S_CONTROL_LEVEL_CNTL		BIT(9)
++#define AIU_MEM_I2S_MASKS_IRQ_BLOCK_MASK	GENMASK(31, 16)
++#define AIU_MEM_I2S_MASKS_IRQ_BLOCK(n)		((n) << 16)
++#define AIU_MEM_I2S_MASKS_CH_MEM_MASK		GENMASK(15, 8)
++#define AIU_MEM_I2S_MASKS_CH_MEM(ch)		((ch) << 8)
++#define AIU_MEM_I2S_MASKS_CH_RD_MASK		GENMASK(7, 0)
++#define AIU_MEM_I2S_MASKS_CH_RD(ch)		((ch) << 0)
++#define AIU_RST_SOFT_I2S_FAST_DOMAIN		BIT(0)
++#define AIU_RST_SOFT_I2S_SLOW_DOMAIN		BIT(1)
++
++/*
++ * The DMA works by i2s "blocks" (or DMA burst). The burst size and the memory
++ * layout expected depends on the mode of operation.
++ *
++ * - Normal mode: The channels are expected to be packed in 32 bytes groups
++ *  interleaved the buffer. AIU_MEM_I2S_MASKS_CH_MEM is a bitfield representing
++ *  the channels present in memory. AIU_MEM_I2S_MASKS_CH_MEM represents the
++ *  channels read by the DMA. This is very flexible but the unsual memory layout
++ *  makes it less easy to deal with. The burst size is 32 bytes times the number
++ *  of channels read.
++ *
++ * - Split mode:
++ * Classical channel interleaved frame organisation. In this mode,
++ * AIU_MEM_I2S_MASKS_CH_MEM and AIU_MEM_I2S_MASKS_CH_MEM must be set to 0xff and
++ * the burst size is fixed to 256 bytes. The input can be either 2 or 8
++ * channels.
++ *
++ * The following driver implements the split mode.
++ */
++
++#define AIU_I2S_DMA_BURST 256
++
++static struct snd_pcm_hardware meson_aiu_i2s_dma_hw = {
++	.info = (SNDRV_PCM_INFO_INTERLEAVED |
++		 SNDRV_PCM_INFO_MMAP |
++		 SNDRV_PCM_INFO_MMAP_VALID |
++		 SNDRV_PCM_INFO_PAUSE),
++
++	.formats = (SNDRV_PCM_FMTBIT_S16_LE |
++		    SNDRV_PCM_FMTBIT_S24_LE |
++		    SNDRV_PCM_FMTBIT_S32_LE),
++
++	/*
++	 * TODO: The DMA can change the endianness, the msb position
++	 * and deal with unsigned - support this later on
++	 */
++
++	.rate_min = 8000,
++	.rate_max = 192000,
++	.channels_min = 2,
++	.channels_max = 8,
++	.period_bytes_min = AIU_I2S_DMA_BURST,
++	.period_bytes_max = AIU_I2S_DMA_BURST * 65535,
++	.periods_min = 2,
++	.periods_max = UINT_MAX,
++	.buffer_bytes_max = 1 * 1024 * 1024,
++	.fifo_size = 0,
++};
++
++static struct meson_aiu_i2s *meson_aiu_i2s_dma_priv(struct snd_pcm_substream *s)
++{
++	struct snd_soc_pcm_runtime *rtd = s->private_data;
++	struct snd_soc_component *component = snd_soc_rtdcom_lookup(rtd, DRV_NAME);
++
++	return snd_soc_component_get_drvdata(component);
++}
++
++static snd_pcm_uframes_t
++meson_aiu_i2s_dma_pointer(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
++	unsigned int addr;
++	int ret;
++
++	ret = regmap_read(priv->core->aiu, AIU_MEM_I2S_RD_PTR,
++			  &addr);
++	if (ret)
++		return 0;
++
++	return bytes_to_frames(runtime, addr - (unsigned int)runtime->dma_addr);
++}
++
++static void __dma_enable(struct meson_aiu_i2s *priv, bool enable)
++{
++	unsigned int en_mask = (AIU_MEM_I2S_CONTROL_FILL_EN |
++				AIU_MEM_I2S_CONTROL_EMPTY_EN);
++
++	regmap_update_bits(priv->core->aiu, AIU_MEM_I2S_CONTROL, en_mask,
++			   enable ? en_mask : 0);
++
++}
++
++static int meson_aiu_i2s_dma_trigger(struct snd_pcm_substream *substream, int cmd)
++{
++	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		__dma_enable(priv, true);
++		break;
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++	case SNDRV_PCM_TRIGGER_STOP:
++		__dma_enable(priv, false);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void __dma_init_mem(struct meson_aiu_i2s *priv)
++{
++	regmap_update_bits(priv->core->aiu, AIU_MEM_I2S_CONTROL,
++			   AIU_MEM_I2S_CONTROL_INIT,
++			   AIU_MEM_I2S_CONTROL_INIT);
++	regmap_update_bits(priv->core->aiu, AIU_MEM_I2S_BUF_CNTL,
++			   AIU_MEM_I2S_BUF_CNTL_INIT,
++			   AIU_MEM_I2S_BUF_CNTL_INIT);
++
++	regmap_update_bits(priv->core->aiu, AIU_MEM_I2S_CONTROL,
++			   AIU_MEM_I2S_CONTROL_INIT,
++			   0);
++	regmap_update_bits(priv->core->aiu, AIU_MEM_I2S_BUF_CNTL,
++			   AIU_MEM_I2S_BUF_CNTL_INIT,
++			   0);
++}
++
++static int meson_aiu_i2s_dma_prepare(struct snd_pcm_substream *substream)
++{
++	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
++
++	__dma_init_mem(priv);
++
++	return 0;
++}
++
++static int meson_aiu_i2s_dma_hw_params(struct snd_pcm_substream *substream,
++				 struct snd_pcm_hw_params *params)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
++	int ret;
++	u32 burst_num, mem_ctl;
++	dma_addr_t end_ptr;
++
++	ret = snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(params));
++	if (ret < 0)
++		return ret;
++
++	/* Setup memory layout */
++	if (params_physical_width(params) == 16)
++		mem_ctl = AIU_MEM_I2S_CONTROL_MODE_16BIT;
++	else
++		mem_ctl = 0;
++
++	regmap_update_bits(priv->core->aiu, AIU_MEM_I2S_CONTROL,
++			   AIU_MEM_I2S_CONTROL_MODE_16BIT,
++			   mem_ctl);
++
++	/* Initialize memory pointers */
++	regmap_write(priv->core->aiu, AIU_MEM_I2S_START_PTR, runtime->dma_addr);
++	regmap_write(priv->core->aiu, AIU_MEM_I2S_RD_PTR, runtime->dma_addr);
++
++	/* The end pointer is the address of the last valid block */
++	end_ptr = runtime->dma_addr + runtime->dma_bytes - AIU_I2S_DMA_BURST;
++	regmap_write(priv->core->aiu, AIU_MEM_I2S_END_PTR, end_ptr);
++
++	/* Memory masks */
++	burst_num = params_period_bytes(params) / AIU_I2S_DMA_BURST;
++	regmap_write(priv->core->aiu, AIU_MEM_I2S_MASKS,
++		     AIU_MEM_I2S_MASKS_CH_RD(0xff) |
++		     AIU_MEM_I2S_MASKS_CH_MEM(0xff) |
++		     AIU_MEM_I2S_MASKS_IRQ_BLOCK(burst_num));
++
++	return 0;
++}
++
++static int meson_aiu_i2s_dma_hw_free(struct snd_pcm_substream *substream)
++{
++	return snd_pcm_lib_free_pages(substream);
++}
++
++
++static irqreturn_t meson_aiu_i2s_dma_irq_block(int irq, void *dev_id)
++{
++	struct snd_pcm_substream *playback = dev_id;
++
++	snd_pcm_period_elapsed(playback);
++
++	return IRQ_HANDLED;
++}
++
++static int meson_aiu_i2s_dma_open(struct snd_pcm_substream *substream)
++{
++	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
++	int ret;
++
++	snd_soc_set_runtime_hwparams(substream, &meson_aiu_i2s_dma_hw);
++
++	/*
++	 * Make sure the buffer and period size are multiple of the DMA burst
++	 * size
++	 */
++	ret = snd_pcm_hw_constraint_step(substream->runtime, 0,
++					 SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
++					 AIU_I2S_DMA_BURST);
++	if (ret)
++		return ret;
++
++	ret = snd_pcm_hw_constraint_step(substream->runtime, 0,
++					 SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
++					 AIU_I2S_DMA_BURST);
++	if (ret)
++		return ret;
++
++	/* Request the I2S DDR irq */
++	ret = request_irq(priv->irq, meson_aiu_i2s_dma_irq_block, 0,
++			  DRV_NAME, substream);
++	if (ret)
++		return ret;
++
++	/* Power up the i2s fast domain - can't write the registers w/o it */
++	ret = clk_prepare_enable(priv->fast);
++	if (ret)
++		return ret;
++
++	/* Make sure the dma is initially disabled */
++	__dma_enable(priv, false);
++
++	return 0;
++}
++
++static int meson_aiu_i2s_dma_close(struct snd_pcm_substream *substream)
++{
++	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
++
++	clk_disable_unprepare(priv->fast);
++	free_irq(priv->irq, substream);
++
++	return 0;
++}
++
++static const struct snd_pcm_ops meson_aiu_i2s_dma_ops = {
++	.open =		meson_aiu_i2s_dma_open,
++	.close =        meson_aiu_i2s_dma_close,
++	.ioctl =	snd_pcm_lib_ioctl,
++	.hw_params =	meson_aiu_i2s_dma_hw_params,
++	.hw_free =      meson_aiu_i2s_dma_hw_free,
++	.prepare =      meson_aiu_i2s_dma_prepare,
++	.pointer =	meson_aiu_i2s_dma_pointer,
++	.trigger =	meson_aiu_i2s_dma_trigger,
++};
++
++static int meson_aiu_i2s_dma_new(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_card *card = rtd->card->snd_card;
++	size_t size = meson_aiu_i2s_dma_hw.buffer_bytes_max;
++
++	snd_pcm_lib_preallocate_pages_for_all(rtd->pcm,
++					      SNDRV_DMA_TYPE_DEV,
++					      card->dev, size, size);
++
++	return 0;
++}
++
++#define AIU_CLK_CTRL_I2S_DIV_EN			BIT(0)
++#define AIU_CLK_CTRL_I2S_DIV_MASK		GENMASK(3, 2)
++#define AIU_CLK_CTRL_AOCLK_POLARITY_MASK	BIT(6)
++#define AIU_CLK_CTRL_AOCLK_POLARITY_NORMAL	(0 << 6)
++#define AIU_CLK_CTRL_AOCLK_POLARITY_INVERTED	(1 << 6)
++#define AIU_CLK_CTRL_ALRCLK_POLARITY_MASK	BIT(7)
++#define AIU_CLK_CTRL_ALRCLK_POLARITY_NORMAL	(0 << 7)
++#define AIU_CLK_CTRL_ALRCLK_POLARITY_INVERTED	(1 << 7)
++#define AIU_CLK_CTRL_ALRCLK_SKEW_MASK		GENMASK(9, 8)
++#define AIU_CLK_CTRL_ALRCLK_LEFT_J		(0 << 8)
++#define AIU_CLK_CTRL_ALRCLK_I2S			(1 << 8)
++#define AIU_CLK_CTRL_ALRCLK_RIGHT_J		(2 << 8)
++#define AIU_CLK_CTRL_MORE_I2S_DIV_MASK		GENMASK(5, 0)
++#define AIU_CLK_CTRL_MORE_I2S_DIV(div)		(((div) - 1) << 0)
++#define AIU_CODEC_DAC_LRCLK_CTRL_DIV_MASK	GENMASK(11, 0)
++#define AIU_CODEC_DAC_LRCLK_CTRL_DIV(div)	(((div) - 1) << 0)
++#define AIU_I2S_DAC_CFG_PAYLOAD_SIZE_MASK	GENMASK(1, 0)
++#define AIU_I2S_DAC_CFG_AOCLK_32		(0 << 0)
++#define AIU_I2S_DAC_CFG_AOCLK_48		(2 << 0)
++#define AIU_I2S_DAC_CFG_AOCLK_64		(3 << 0)
++#define AIU_I2S_MISC_HOLD_EN			BIT(2)
++#define AIU_I2S_SOURCE_DESC_MODE_8CH		BIT(0)
++#define AIU_I2S_SOURCE_DESC_MODE_24BIT		BIT(5)
++#define AIU_I2S_SOURCE_DESC_MODE_32BIT		BIT(9)
++#define AIU_I2S_SOURCE_DESC_MODE_SPLIT		BIT(11)
++
++static void __hold(struct meson_aiu_i2s *priv, bool enable)
++{
++	regmap_update_bits(priv->core->aiu, AIU_I2S_MISC,
++			   AIU_I2S_MISC_HOLD_EN,
++			   enable ? AIU_I2S_MISC_HOLD_EN : 0);
++}
++
++static void __divider_enable(struct meson_aiu_i2s *priv, bool enable)
++{
++	regmap_update_bits(priv->core->aiu, AIU_CLK_CTRL,
++			   AIU_CLK_CTRL_I2S_DIV_EN,
++			   enable ? AIU_CLK_CTRL_I2S_DIV_EN : 0);
++}
++
++static void __playback_start(struct meson_aiu_i2s *priv)
++{
++	__divider_enable(priv, true);
++	__hold(priv, false);
++}
++
++static void __playback_stop(struct meson_aiu_i2s *priv, bool clk_force)
++{
++	__hold(priv, true);
++	/* Disable the bit clks if necessary */
++	if (clk_force || !priv->bclks_idle)
++		__divider_enable(priv, false);
++}
++
++static int meson_aiu_i2s_dai_trigger(struct snd_pcm_substream *substream, int cmd,
++				 struct snd_soc_dai *dai)
++{
++	struct meson_aiu_i2s *priv = snd_soc_dai_get_drvdata(dai);
++	bool clk_force_stop = false;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		__playback_start(priv);
++		return 0;
++
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++		clk_force_stop = true;
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		__playback_stop(priv, clk_force_stop);
++		return 0;
++
++	default:
++		return -EINVAL;
++	}
++}
++
++static int __bclks_set_rate(struct meson_aiu_i2s *priv, unsigned int srate,
++			    unsigned int width)
++{
++	unsigned int fs;
++
++	/* Get the oversampling factor */
++	fs = DIV_ROUND_CLOSEST(clk_get_rate(priv->mclk), srate);
++
++	/*
++	 * This DAI is usually connected to the dw-hdmi which does not support
++	 * bclk being 32 * lrclk or 48 * lrclk
++	 * Restrict to blck = 64 * lrclk
++	 */
++	if (fs % 64)
++		return -EINVAL;
++
++	/* Set the divider between lrclk and bclk */
++	regmap_update_bits(priv->core->aiu, AIU_I2S_DAC_CFG,
++			   AIU_I2S_DAC_CFG_PAYLOAD_SIZE_MASK,
++			   AIU_I2S_DAC_CFG_AOCLK_64);
++
++	regmap_update_bits(priv->core->aiu, AIU_CODEC_DAC_LRCLK_CTRL,
++			   AIU_CODEC_DAC_LRCLK_CTRL_DIV_MASK,
++			   AIU_CODEC_DAC_LRCLK_CTRL_DIV(64));
++
++	/* Use CLK_MORE for the i2s divider */
++	regmap_update_bits(priv->core->aiu, AIU_CLK_CTRL,
++			   AIU_CLK_CTRL_I2S_DIV_MASK,
++			   0);
++
++	regmap_update_bits(priv->core->aiu, AIU_CLK_CTRL_MORE,
++			   AIU_CLK_CTRL_MORE_I2S_DIV_MASK,
++			   AIU_CLK_CTRL_MORE_I2S_DIV(fs / 64));
++
++	return 0;
++}
++
++static int __setup_desc(struct meson_aiu_i2s *priv, unsigned int width,
++			unsigned int channels)
++{
++	u32 desc = 0;
++
++	switch (width) {
++	case 24:
++		/*
++		 * For some reason, 24 bits wide audio don't play well
++		 * if the 32 bits mode is not set
++		 */
++		desc |= (AIU_I2S_SOURCE_DESC_MODE_24BIT |
++			 AIU_I2S_SOURCE_DESC_MODE_32BIT);
++		break;
++	case 16:
++		break;
++
++	default:
++		return -EINVAL;
++	}
++
++	switch (channels) {
++	case 2: /* Nothing to do */
++		break;
++	case 8:
++		/* TODO: Still requires testing ... */
++		desc |= AIU_I2S_SOURCE_DESC_MODE_8CH;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(priv->core->aiu, AIU_I2S_SOURCE_DESC,
++			   AIU_I2S_SOURCE_DESC_MODE_8CH |
++			   AIU_I2S_SOURCE_DESC_MODE_24BIT |
++			   AIU_I2S_SOURCE_DESC_MODE_32BIT,
++			   desc);
++
++	return 0;
++}
++
++static int meson_aiu_i2s_dai_hw_params(struct snd_pcm_substream *substream,
++				   struct snd_pcm_hw_params *params,
++				   struct snd_soc_dai *dai)
++{
++	struct meson_aiu_i2s *priv = snd_soc_dai_get_drvdata(dai);
++	unsigned int width = params_width(params);
++	unsigned int channels = params_channels(params);
++	unsigned int rate = params_rate(params);
++	int ret;
++
++	ret = __setup_desc(priv, width, channels);
++	if (ret) {
++		dev_err(dai->dev, "Unable set to set i2s description\n");
++		return ret;
++	}
++
++	ret = __bclks_set_rate(priv, rate, width);
++	if (ret) {
++		dev_err(dai->dev, "Unable set to the i2s clock rates\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static int meson_aiu_i2s_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	struct meson_aiu_i2s *priv = snd_soc_dai_get_drvdata(dai);
++	u32 val;
++
++	if ((fmt & SND_SOC_DAIFMT_MASTER_MASK) != SND_SOC_DAIFMT_CBS_CFS)
++		return -EINVAL;
++
++	/* DAI output mode */
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_I2S:
++		val = AIU_CLK_CTRL_ALRCLK_I2S;
++		break;
++	case SND_SOC_DAIFMT_LEFT_J:
++		val = AIU_CLK_CTRL_ALRCLK_LEFT_J;
++		break;
++	case SND_SOC_DAIFMT_RIGHT_J:
++		val = AIU_CLK_CTRL_ALRCLK_RIGHT_J;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(priv->core->aiu, AIU_CLK_CTRL,
++			   AIU_CLK_CTRL_ALRCLK_SKEW_MASK,
++			   val);
++
++	/* DAI clock polarity */
++	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
++	case SND_SOC_DAIFMT_IB_IF:
++		/* Invert both clocks */
++		val = AIU_CLK_CTRL_ALRCLK_POLARITY_INVERTED |
++			AIU_CLK_CTRL_AOCLK_POLARITY_INVERTED;
++		break;
++	case SND_SOC_DAIFMT_IB_NF:
++		/* Invert bit clock */
++		val = AIU_CLK_CTRL_ALRCLK_POLARITY_NORMAL |
++			AIU_CLK_CTRL_AOCLK_POLARITY_INVERTED;
++		break;
++	case SND_SOC_DAIFMT_NB_IF:
++		/* Invert frame clock */
++		val = AIU_CLK_CTRL_ALRCLK_POLARITY_INVERTED |
++			AIU_CLK_CTRL_AOCLK_POLARITY_NORMAL;
++		break;
++	case SND_SOC_DAIFMT_NB_NF:
++		/* Normal clocks */
++		val = AIU_CLK_CTRL_ALRCLK_POLARITY_NORMAL |
++			AIU_CLK_CTRL_AOCLK_POLARITY_NORMAL;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(priv->core->aiu, AIU_CLK_CTRL,
++			   AIU_CLK_CTRL_ALRCLK_POLARITY_MASK |
++			   AIU_CLK_CTRL_AOCLK_POLARITY_MASK,
++			   val);
++
++	switch (fmt & SND_SOC_DAIFMT_CLOCK_MASK) {
++	case SND_SOC_DAIFMT_CONT:
++		priv->bclks_idle = true;
++		break;
++	case SND_SOC_DAIFMT_GATED:
++		priv->bclks_idle = false;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int meson_aiu_i2s_dai_set_sysclk(struct snd_soc_dai *dai, int clk_id,
++				    unsigned int freq, int dir)
++{
++	struct meson_aiu_i2s *priv = snd_soc_dai_get_drvdata(dai);
++	int ret;
++
++	if (WARN_ON(clk_id != 0))
++		return -EINVAL;
++
++	if (dir == SND_SOC_CLOCK_IN)
++		return 0;
++
++	ret = clk_set_rate(priv->mclk, freq);
++	if (ret) {
++		dev_err(dai->dev, "Failed to set sysclk to %uHz", freq);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int meson_aiu_i2s_dai_startup(struct snd_pcm_substream *substream,
++				 struct snd_soc_dai *dai)
++{
++	struct meson_aiu_i2s *priv = snd_soc_dai_get_drvdata(dai);
++	int ret;
++
++	/* Power up the i2s fast domain - can't write the registers w/o it */
++	ret = clk_prepare_enable(priv->fast);
++	if (ret)
++		goto out_clk_fast;
++
++	/* Make sure nothing gets out of the DAI yet */
++	__hold(priv, true);
++
++	/* I2S encoder needs the mixer interface gate */
++	ret = clk_prepare_enable(priv->iface);
++	if (ret)
++		goto out_clk_iface;
++
++	/* Enable the i2s master clock */
++	ret = clk_prepare_enable(priv->mclk);
++	if (ret)
++		goto out_mclk;
++
++	/* Enable the bit clock gate */
++	ret = clk_prepare_enable(priv->bclks);
++	if (ret)
++		goto out_bclks;
++
++	/* Make sure the interface expect a memory layout we can work with */
++	regmap_update_bits(priv->core->aiu, AIU_I2S_SOURCE_DESC,
++			   AIU_I2S_SOURCE_DESC_MODE_SPLIT,
++			   AIU_I2S_SOURCE_DESC_MODE_SPLIT);
++
++	return 0;
++
++out_bclks:
++	clk_disable_unprepare(priv->mclk);
++out_mclk:
++	clk_disable_unprepare(priv->iface);
++out_clk_iface:
++	clk_disable_unprepare(priv->fast);
++out_clk_fast:
++	return ret;
++}
++
++static void meson_aiu_i2s_dai_shutdown(struct snd_pcm_substream *substream,
++				   struct snd_soc_dai *dai)
++{
++	struct meson_aiu_i2s *priv = snd_soc_dai_get_drvdata(dai);
++
++	clk_disable_unprepare(priv->bclks);
++	clk_disable_unprepare(priv->mclk);
++	clk_disable_unprepare(priv->iface);
++	clk_disable_unprepare(priv->fast);
++}
++
++static const struct snd_soc_dai_ops meson_aiu_i2s_dai_ops = {
++	.startup    = meson_aiu_i2s_dai_startup,
++	.shutdown   = meson_aiu_i2s_dai_shutdown,
++	.trigger    = meson_aiu_i2s_dai_trigger,
++	.hw_params  = meson_aiu_i2s_dai_hw_params,
++	.set_fmt    = meson_aiu_i2s_dai_set_fmt,
++	.set_sysclk = meson_aiu_i2s_dai_set_sysclk,
++};
++
++static struct snd_soc_dai_driver meson_aiu_i2s_dai = {
++	.playback = {
++		.stream_name = "Playback",
++		.channels_min = 2,
++		.channels_max = 8,
++		.rates = SNDRV_PCM_RATE_8000_192000,
++		.formats = (SNDRV_PCM_FMTBIT_S16_LE |
++			    SNDRV_PCM_FMTBIT_S24_LE)
++	},
++	.ops = &meson_aiu_i2s_dai_ops,
++};
++
++static const struct snd_soc_component_driver meson_aiu_i2s_component = {
++	.ops = &meson_aiu_i2s_dma_ops,
++	.pcm_new = meson_aiu_i2s_dma_new,
++	.name	= DRV_NAME,
++};
++
++static int meson_aiu_i2s_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct meson_aiu_i2s *priv;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, priv);
++	priv->core = dev_get_drvdata(dev->parent);
++
++	priv->fast = devm_clk_get(dev, "fast");
++	if (IS_ERR(priv->fast)) {
++		if (PTR_ERR(priv->fast) != -EPROBE_DEFER)
++			dev_err(dev, "Can't get the i2s fast domain clock\n");
++		return PTR_ERR(priv->fast);
++	}
++
++	priv->iface = devm_clk_get(dev, "iface");
++	if (IS_ERR(priv->iface)) {
++		if (PTR_ERR(priv->iface) != -EPROBE_DEFER)
++			dev_err(dev, "Can't get i2s dai clock gate\n");
++		return PTR_ERR(priv->iface);
++	}
++
++	priv->bclks = devm_clk_get(dev, "bclks");
++	if (IS_ERR(priv->bclks)) {
++		if (PTR_ERR(priv->bclks) != -EPROBE_DEFER)
++			dev_err(dev, "Can't get bit clocks gate\n");
++		return PTR_ERR(priv->bclks);
++	}
++
++	priv->mclk = devm_clk_get(dev, "mclk");
++	if (IS_ERR(priv->mclk)) {
++		if (PTR_ERR(priv->mclk) != -EPROBE_DEFER)
++			dev_err(dev, "failed to get the i2s master clock\n");
++		return PTR_ERR(priv->mclk);
++	}
++
++	priv->irq = platform_get_irq(pdev, 0);
++	if (priv->irq <= 0) {
++		dev_err(dev, "Can't get i2s ddr irq\n");
++		return priv->irq;
++	}
++
++	return devm_snd_soc_register_component(dev, &meson_aiu_i2s_component,
++					       &meson_aiu_i2s_dai, 1);
++}
++
++static const struct of_device_id meson_aiu_i2s_of_match[] = {
++	{ .compatible = "amlogic,meson-aiu-i2s", },
++	{}
++};
++MODULE_DEVICE_TABLE(of, meson_aiu_i2s_of_match);
++
++static struct platform_driver meson_aiu_i2s_pdrv = {
++	.probe = meson_aiu_i2s_probe,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = meson_aiu_i2s_of_match,
++	},
++};
++module_platform_driver(meson_aiu_i2s_pdrv);
++
++MODULE_DESCRIPTION("Meson AIU i2s ASoC Driver");
++MODULE_AUTHOR("Jerome Brunet <jbrunet@baylibre.com>");
++MODULE_LICENSE("GPL v2");
+-- 
+2.24.0
+
+
+From 7adbd0e2237400a2d48256423bacfac4509370bd Mon Sep 17 00:00:00 2001
+From: Jerome Brunet <jbrunet@baylibre.com>
+Date: Thu, 30 Mar 2017 15:19:04 +0200
+Subject: [PATCH 08/12] ARM64: dts: meson-gx: add audio controller nodes
+
+Add audio controller nodes for Amlogic meson gxbb and gxl.
+This includes the audio-core node, the i2s and spdif DAIs
+
+Audio on this SoC family is still a work in progress. More nodes are likely
+to be added later on (pcm DAIs, input DMAs, etc ...)
+
+Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+---
+ arch/arm64/boot/dts/amlogic/meson-gx.dtsi   | 23 ++++++++++++++++++
+ arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi | 27 +++++++++++++++++++++
+ arch/arm64/boot/dts/amlogic/meson-gxl.dtsi  | 27 +++++++++++++++++++++
+ 3 files changed, 77 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gx.dtsi b/arch/arm64/boot/dts/amlogic/meson-gx.dtsi
+index 40db06e28b662..aced7cc92c9ce 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gx.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gx.dtsi
+@@ -226,6 +226,29 @@ reset: reset-controller@4404 {
+ 				#reset-cells = <1>;
+ 			};
+ 
++			audio: audio@5400 {
++				compatible = "amlogic,meson-gx-audio-core";
++				reg = <0x0 0x5400 0x0 0x2ac>,
++				      <0x0 0xa000 0x0 0x304>;
++				reg-names = "aiu", "audin";
++				status = "disabled";
++
++				aiu_i2s: audio-controller-0 {
++					#sound-dai-cells = <0>;
++					compatible = "amlogic,meson-aiu-i2s";
++					interrupts = <GIC_SPI 48 IRQ_TYPE_EDGE_RISING>;
++					status = "disabled";
++				};
++
++				aiu_spdif: audio-controller-1 {
++					#sound-dai-cells = <0>;
++					compatible = "amlogic,meson-aiu-spdif";
++					interrupts = <GIC_SPI 50 IRQ_TYPE_EDGE_RISING>;
++					status = "disabled";
++				};
++
++			};
++
+ 			uart_A: serial@84c0 {
+ 				compatible = "amlogic,meson-gx-uart";
+ 				reg = <0x0 0x84c0 0x0 0x18>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi b/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi
+index 0cb40326b0d3f..6325d5dd558fe 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi
+@@ -724,6 +724,24 @@ mux {
+ 	};
+ };
+ 
++&audio {
++	clocks = <&clkc CLKID_AIU>,
++		 <&clkc CLKID_AIU_GLUE>,
++		 <&clkc CLKID_I2S_SPDIF>;
++	clock-names = "aiu_top", "aiu_glue", "audin";
++	resets = <&reset RESET_AIU>,
++		 <&reset RESET_AUDIN>;
++	reset-names = "aiu", "audin";
++};
++
++&aiu_i2s {
++	clocks = <&clkc CLKID_I2S_OUT>,
++		 <&clkc CLKID_MIXER_IFACE>,
++		 <&clkc CLKID_AOCLK_GATE>,
++		 <&clkc CLKID_CTS_AMCLK>;
++	clock-names = "fast", "iface", "bclks", "mclk";
++};
++
+ &pwrc_vpu {
+ 	resets = <&reset RESET_VIU>,
+ 		 <&reset RESET_VENC>,
+@@ -812,6 +830,15 @@ &spicc {
+ 	num-cs = <1>;
+ };
+ 
++&aiu_spdif {
++	clocks = <&clkc CLKID_IEC958>,
++		 <&clkc CLKID_IEC958_GATE>,
++		 <&clkc CLKID_CTS_MCLK_I958>,
++		 <&clkc CLKID_CTS_AMCLK>,
++		 <&clkc CLKID_CTS_I958>;
++	clock-names = "fast", "iface", "mclk_i958", "mclk_i2s", "mclk";
++};
++
+ &spifc {
+ 	clocks = <&clkc CLKID_SPI>;
+ };
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi b/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi
+index ed33d8efaf62f..6840671524932 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi
+@@ -734,6 +734,24 @@ external_mdio: mdio@2009087f {
+ 	};
+ };
+ 
++&audio {
++	clocks = <&clkc CLKID_AIU>,
++		 <&clkc CLKID_AIU_GLUE>,
++		 <&clkc CLKID_I2S_SPDIF>;
++	clock-names = "aiu_top", "aiu_glue", "audin";
++	resets = <&reset RESET_AIU>,
++		 <&reset RESET_AUDIN>;
++	reset-names = "aiu", "audin";
++};
++
++&aiu_i2s {
++	clocks = <&clkc CLKID_I2S_OUT>,
++		 <&clkc CLKID_MIXER_IFACE>,
++		 <&clkc CLKID_AOCLK_GATE>,
++		 <&clkc CLKID_CTS_AMCLK>;
++	clock-names = "fast", "iface", "bclks", "mclk";
++};
++
+ &pwrc_vpu {
+ 	resets = <&reset RESET_VIU>,
+ 		 <&reset RESET_VENC>,
+@@ -822,6 +840,15 @@ &spicc {
+ 	num-cs = <1>;
+ };
+ 
++&aiu_spdif {
++	clocks = <&clkc CLKID_IEC958>,
++		 <&clkc CLKID_IEC958_GATE>,
++		 <&clkc CLKID_CTS_MCLK_I958>,
++		 <&clkc CLKID_CTS_AMCLK>,
++		 <&clkc CLKID_CTS_I958>;
++	clock-names = "fast", "iface", "mclk_i958", "mclk_i2s", "mclk";
++};
++
+ &spifc {
+ 	clocks = <&clkc CLKID_SPI>;
+ };
+-- 
+2.24.0
+
+
+From e5ce0e8877f085880976cba73eae1dfa08f5aa19 Mon Sep 17 00:00:00 2001
+From: Jerome Brunet <jbrunet@baylibre.com>
+Date: Fri, 7 Jul 2017 17:39:21 +0200
+Subject: [PATCH 09/12] snd: meson: activate HDMI audio path
+
+Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+---
+ sound/soc/meson-gx/aiu-i2s.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/sound/soc/meson-gx/aiu-i2s.c b/sound/soc/meson-gx/aiu-i2s.c
+index 63d7821c2c72d..c6bfd5d8c8081 100644
+--- a/sound/soc/meson-gx/aiu-i2s.c
++++ b/sound/soc/meson-gx/aiu-i2s.c
+@@ -334,8 +334,19 @@ static int meson_aiu_i2s_dma_new(struct snd_soc_pcm_runtime *rtd)
+ #define AIU_CLK_CTRL_ALRCLK_RIGHT_J		(2 << 8)
+ #define AIU_CLK_CTRL_MORE_I2S_DIV_MASK		GENMASK(5, 0)
+ #define AIU_CLK_CTRL_MORE_I2S_DIV(div)		(((div) - 1) << 0)
++#define AIU_CLK_CTRL_MORE_HDMI_TX_SEL_MASK     BIT(6)
++#define AIU_CLK_CTRL_MORE_HDMI_TX_I958_CLK     (0 << 6)
++#define AIU_CLK_CTRL_MORE_HDMI_TX_INT_CLK      (1 << 6)
+ #define AIU_CODEC_DAC_LRCLK_CTRL_DIV_MASK	GENMASK(11, 0)
+ #define AIU_CODEC_DAC_LRCLK_CTRL_DIV(div)	(((div) - 1) << 0)
++#define AIU_HDMI_CLK_DATA_CTRL_CLK_SEL_MASK    GENMASK(1, 0)
++#define AIU_HDMI_CLK_DATA_CTRL_CLK_DISABLE     (0 << 0)
++#define AIU_HDMI_CLK_DATA_CTRL_CLK_PCM         (1 << 0)
++#define AIU_HDMI_CLK_DATA_CTRL_CLK_I2S         (2 << 0)
++#define AIU_HDMI_CLK_DATA_CTRL_DATA_SEL_MASK   GENMASK(5, 4)
++#define AIU_HDMI_CLK_DATA_CTRL_DATA_MUTE       (0 << 4)
++#define AIU_HDMI_CLK_DATA_CTRL_DATA_PCM                (1 << 4)
++#define AIU_HDMI_CLK_DATA_CTRL_DATA_I2S                (2 << 4)
+ #define AIU_I2S_DAC_CFG_PAYLOAD_SIZE_MASK	GENMASK(1, 0)
+ #define AIU_I2S_DAC_CFG_AOCLK_32		(0 << 0)
+ #define AIU_I2S_DAC_CFG_AOCLK_48		(2 << 0)
+@@ -499,6 +510,17 @@ static int meson_aiu_i2s_dai_hw_params(struct snd_pcm_substream *substream,
+ 		return ret;
+ 	}
+ 
++       /* Quick and dirty hack for HDMI */
++	regmap_update_bits(priv->core->aiu, AIU_HDMI_CLK_DATA_CTRL,
++			   AIU_HDMI_CLK_DATA_CTRL_CLK_SEL_MASK |
++			   AIU_HDMI_CLK_DATA_CTRL_DATA_SEL_MASK,
++			   AIU_HDMI_CLK_DATA_CTRL_CLK_I2S |
++			   AIU_HDMI_CLK_DATA_CTRL_DATA_I2S);
++
++	regmap_update_bits(priv->core->aiu, AIU_CLK_CTRL_MORE,
++			   AIU_CLK_CTRL_MORE_HDMI_TX_SEL_MASK,
++			   AIU_CLK_CTRL_MORE_HDMI_TX_INT_CLK);
++
+ 	return 0;
+ }
+ 
+-- 
+2.24.0
+
+
+From 2a4a894c4726a69ffd9b43f40997dddf569e30eb Mon Sep 17 00:00:00 2001
+From: Jerome Brunet <jbrunet@baylibre.com>
+Date: Wed, 20 Sep 2017 18:01:26 +0200
+Subject: [PATCH 10/12] ARM64: dts: meson-gx: add sound-dai-cells to HDMI node
+
+Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+---
+ arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi | 1 +
+ arch/arm64/boot/dts/amlogic/meson-gxl.dtsi  | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi b/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi
+index 6325d5dd558fe..1e750ace285e5 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gxbb.dtsi
+@@ -330,6 +330,7 @@ &hdmi_tx {
+ 		 <&clkc CLKID_CLK81>,
+ 		 <&clkc CLKID_GCLK_VENCI_INT0>;
+ 	clock-names = "isfr", "iahb", "venci";
++	#sound-dai-cells = <0>; 
+ };
+ 
+ &sysctrl {
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi b/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi
+index 6840671524932..9c544174864f5 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gxl.dtsi
+@@ -287,6 +287,7 @@ &hdmi_tx {
+ 		 <&clkc CLKID_CLK81>,
+ 		 <&clkc CLKID_GCLK_VENCI_INT0>;
+ 	clock-names = "isfr", "iahb", "venci";
++	#sound-dai-cells = <0>;
+ };
+ 
+ &sysctrl {
+-- 
+2.24.0
+
+
+From 6417afd8f45db6c17c28a61660d84ec2a3ba2340 Mon Sep 17 00:00:00 2001
+From: Jerome Brunet <jbrunet@baylibre.com>
+Date: Wed, 20 Sep 2017 18:10:08 +0200
+Subject: [PATCH 11/12] ARM64: dts: meson: activate hdmi audio HDMI enabled
+ boards
+
+This patch activate audio over HDMI on selected boards
+
+Please note that this audio support is based on WIP changes
+This should be considered as preview and it does not reflect
+the audio I expect to see merged
+
+Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+Signed-off-by: Neil Armstrong <narmstrong@baylibre.com>
+---
+ .../boot/dts/amlogic/meson-gx-p23x-q20x.dtsi  | 37 +++++++++++++++++++
+ .../boot/dts/amlogic/meson-gxbb-nanopi-k2.dts | 37 +++++++++++++++++++
+ .../dts/amlogic/meson-gxbb-nexbox-a95x.dts    | 37 +++++++++++++++++++
+ .../boot/dts/amlogic/meson-gxbb-odroidc2.dts  | 37 +++++++++++++++++++
+ .../boot/dts/amlogic/meson-gxbb-p20x.dtsi     | 37 +++++++++++++++++++
+ .../boot/dts/amlogic/meson-gxbb-wetek.dtsi    | 37 +++++++++++++++++++
+ .../amlogic/meson-gxl-s905x-khadas-vim.dts    | 37 +++++++++++++++++++
+ .../amlogic/meson-gxl-s905x-libretech-cc.dts  | 37 +++++++++++++++++++
+ .../amlogic/meson-gxl-s905x-nexbox-a95x.dts   | 37 +++++++++++++++++++
+ .../boot/dts/amlogic/meson-gxl-s905x-p212.dts | 37 +++++++++++++++++++
+ .../dts/amlogic/meson-gxm-khadas-vim2.dts     | 37 +++++++++++++++++++
+ .../boot/dts/amlogic/meson-gxm-nexbox-a1.dts  | 37 +++++++++++++++++++
+ 12 files changed, 444 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gx-p23x-q20x.dtsi b/arch/arm64/boot/dts/amlogic/meson-gx-p23x-q20x.dtsi
+index 12d5e333e5f2c..6397a4956014d 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gx-p23x-q20x.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gx-p23x-q20x.dtsi
+@@ -102,6 +102,35 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
+ };
+ 
+ &cec_AO {
+@@ -111,6 +140,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cvbs_vdac_port {
+ 	cvbs_vdac_out: endpoint {
+ 		remote-endpoint = <&cvbs_connector_in>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxbb-nanopi-k2.dts b/arch/arm64/boot/dts/amlogic/meson-gxbb-nanopi-k2.dts
+index d6ca684e0e616..2c2ca5c51478c 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxbb-nanopi-k2.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxbb-nanopi-k2.dts
+@@ -89,6 +89,35 @@ sdio_pwrseq: sdio-pwrseq {
+ 		clock-names = "ext_clock";
+ 	};
+ 
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
++
+ 	vcc1v8: regulator-vcc1v8 {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "VCC1.8V";
+@@ -132,6 +161,14 @@ hdmi_connector_in: endpoint {
+ 	};
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cec_AO {
+ 	status = "okay";
+ 	pinctrl-0 = <&ao_cec_pins>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxbb-nexbox-a95x.dts b/arch/arm64/boot/dts/amlogic/meson-gxbb-nexbox-a95x.dts
+index 65ec7dea828c1..b015d1d222d38 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxbb-nexbox-a95x.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxbb-nexbox-a95x.dts
+@@ -119,6 +119,35 @@ sdio_pwrseq: sdio-pwrseq {
+ 		clock-names = "ext_clock";
+ 	};
+ 
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
++	
+ 	cvbs-connector {
+ 		compatible = "composite-video-connector";
+ 
+@@ -154,6 +183,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &ethmac {
+ 	status = "okay";
+ 	pinctrl-0 = <&eth_rmii_pins>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxbb-odroidc2.dts b/arch/arm64/boot/dts/amlogic/meson-gxbb-odroidc2.dts
+index 6ded279c40c86..d6f2953cafb17 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxbb-odroidc2.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxbb-odroidc2.dts
+@@ -172,6 +172,35 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};	
+ };
+ 
+ &cec_AO {
+@@ -181,6 +210,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &ethmac {
+ 	status = "okay";
+ 	pinctrl-0 = <&eth_rgmii_pins>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxbb-p20x.dtsi b/arch/arm64/boot/dts/amlogic/meson-gxbb-p20x.dtsi
+index e803a466fe4eb..28489c48f39b7 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxbb-p20x.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gxbb-p20x.dtsi
+@@ -113,6 +113,35 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};	
+ };
+ 
+ &cec_AO {
+@@ -122,6 +151,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cvbs_vdac_port {
+ 	cvbs_vdac_out: endpoint {
+ 		remote-endpoint = <&cvbs_connector_in>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxbb-wetek.dtsi b/arch/arm64/boot/dts/amlogic/meson-gxbb-wetek.dtsi
+index dee51cf952237..ca9777bef2d4a 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxbb-wetek.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gxbb-wetek.dtsi
+@@ -112,6 +112,43 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
++};
++
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
+ };
+ 
+ &cec_AO {
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-khadas-vim.dts b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-khadas-vim.dts
+index 440bc23c73426..a3c67d7a70e4d 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-khadas-vim.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-khadas-vim.dts
+@@ -63,6 +63,35 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
+ };
+ 
+ &cec_AO {
+@@ -72,6 +101,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &hdmi_tx {
+ 	status = "okay";
+ 	pinctrl-0 = <&hdmi_hpd_pins>, <&hdmi_i2c_pins>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-libretech-cc.dts b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-libretech-cc.dts
+index e8348b2728db5..8b78e6f1d3106 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-libretech-cc.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-libretech-cc.dts
+@@ -85,6 +85,35 @@ hdmi_5v: regulator-hdmi-5v {
+ 		regulator-always-on;
+ 	};
+ 
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
++
+ 	vcc_3v3: regulator-vcc_3v3 {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "VCC_3V3";
+@@ -133,6 +162,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cvbs_vdac_port {
+ 	cvbs_vdac_out: endpoint {
+ 		remote-endpoint = <&cvbs_connector_in>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-nexbox-a95x.dts b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-nexbox-a95x.dts
+index 62dd87821ce51..59e41152bbbb3 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-nexbox-a95x.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-nexbox-a95x.dts
+@@ -102,6 +102,35 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
+ };
+ 
+ &cec_AO {
+@@ -111,6 +140,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cvbs_vdac_port {
+ 	cvbs_vdac_out: endpoint {
+ 		remote-endpoint = <&cvbs_connector_in>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dts b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dts
+index 2602940c2077b..78c3060c5d567 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dts
+@@ -32,6 +32,35 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
+ };
+ 
+ &cec_AO {
+@@ -41,6 +70,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cvbs_vdac_port {
+ 	cvbs_vdac_out: endpoint {
+ 		remote-endpoint = <&cvbs_connector_in>;
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxm-khadas-vim2.dts b/arch/arm64/boot/dts/amlogic/meson-gxm-khadas-vim2.dts
+index f82f25c1a5f97..a7a49668c6004 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxm-khadas-vim2.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxm-khadas-vim2.dts
+@@ -82,6 +82,35 @@ hdmi_connector_in: endpoint {
+ 		};
+ 	};
+ 
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
++
+ 	pwmleds {
+ 		compatible = "pwm-leds";
+ 
+@@ -198,6 +227,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cpu0 {
+ 	#cooling-cells = <2>;
+ };
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxm-nexbox-a1.dts b/arch/arm64/boot/dts/amlogic/meson-gxm-nexbox-a1.dts
+index c2bd4dbbf38c5..b6519bbdaadba 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxm-nexbox-a1.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxm-nexbox-a1.dts
+@@ -75,6 +75,35 @@ hdmi_connector_in: endpoint {
+ 			};
+ 		};
+ 	};
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "meson-gx-audio";
++
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		simple-audio-card,dai-link@0 {
++			/* HDMI Output */
++			format = "i2s";
++			mclk-fs = <256>;
++			bitclock-master = <&aiu_i2s>;
++			frame-master = <&aiu_i2s>;
++
++			cpu {
++				sound-dai = <&aiu_i2s>;
++			};
++
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
+ };
+ 
+ &cec_AO {
+@@ -84,6 +113,14 @@ &cec_AO {
+ 	hdmi-phandle = <&hdmi_tx>;
+ };
+ 
++&audio {
++	status = "okay";
++};
++
++&aiu_i2s {
++	status = "okay";
++};
++
+ &cvbs_vdac_port {
+ 	cvbs_vdac_out: endpoint {
+ 		remote-endpoint = <&cvbs_connector_in>;
+-- 
+2.24.0
+
+
+From 0303405068569ab49ca118df7267f73e8d345fb9 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Mon, 9 Dec 2019 18:46:18 +0200
+Subject: [PATCH 12/12] ASoC: meson: aiu i2s: quick and dirty big meh
+
+---
+ sound/soc/meson-gx/aiu-i2s.c | 35 +++++++++++++++++------------------
+ 1 file changed, 17 insertions(+), 18 deletions(-)
+
+diff --git a/sound/soc/meson-gx/aiu-i2s.c b/sound/soc/meson-gx/aiu-i2s.c
+index c6bfd5d8c8081..33a63135e94a4 100644
+--- a/sound/soc/meson-gx/aiu-i2s.c
++++ b/sound/soc/meson-gx/aiu-i2s.c
+@@ -118,7 +118,7 @@ static struct meson_aiu_i2s *meson_aiu_i2s_dma_priv(struct snd_pcm_substream *s)
+ }
+ 
+ static snd_pcm_uframes_t
+-meson_aiu_i2s_dma_pointer(struct snd_pcm_substream *substream)
++meson_aiu_i2s_dma_pointer(struct snd_soc_component *component, struct snd_pcm_substream *substream)
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
+@@ -143,7 +143,7 @@ static void __dma_enable(struct meson_aiu_i2s *priv, bool enable)
+ 
+ }
+ 
+-static int meson_aiu_i2s_dma_trigger(struct snd_pcm_substream *substream, int cmd)
++static int meson_aiu_i2s_dma_trigger(struct snd_soc_component *component, struct snd_pcm_substream *substream, int cmd)
+ {
+ 	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
+ 
+@@ -182,7 +182,7 @@ static void __dma_init_mem(struct meson_aiu_i2s *priv)
+ 			   0);
+ }
+ 
+-static int meson_aiu_i2s_dma_prepare(struct snd_pcm_substream *substream)
++static int meson_aiu_i2s_dma_prepare(struct snd_soc_component *component, struct snd_pcm_substream *substream)
+ {
+ 	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
+ 
+@@ -191,7 +191,7 @@ static int meson_aiu_i2s_dma_prepare(struct snd_pcm_substream *substream)
+ 	return 0;
+ }
+ 
+-static int meson_aiu_i2s_dma_hw_params(struct snd_pcm_substream *substream,
++static int meson_aiu_i2s_dma_hw_params(struct snd_soc_component *component, struct snd_pcm_substream *substream,
+ 				 struct snd_pcm_hw_params *params)
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+@@ -232,7 +232,7 @@ static int meson_aiu_i2s_dma_hw_params(struct snd_pcm_substream *substream,
+ 	return 0;
+ }
+ 
+-static int meson_aiu_i2s_dma_hw_free(struct snd_pcm_substream *substream)
++static int meson_aiu_i2s_dma_hw_free(struct snd_soc_component *component, struct snd_pcm_substream *substream)
+ {
+ 	return snd_pcm_lib_free_pages(substream);
+ }
+@@ -247,7 +247,7 @@ static irqreturn_t meson_aiu_i2s_dma_irq_block(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static int meson_aiu_i2s_dma_open(struct snd_pcm_substream *substream)
++static int meson_aiu_i2s_dma_open(struct snd_soc_component *component, struct snd_pcm_substream *substream)
+ {
+ 	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
+ 	int ret;
+@@ -287,7 +287,7 @@ static int meson_aiu_i2s_dma_open(struct snd_pcm_substream *substream)
+ 	return 0;
+ }
+ 
+-static int meson_aiu_i2s_dma_close(struct snd_pcm_substream *substream)
++static int meson_aiu_i2s_dma_close(struct snd_soc_component *component, struct snd_pcm_substream *substream)
+ {
+ 	struct meson_aiu_i2s *priv = meson_aiu_i2s_dma_priv(substream);
+ 
+@@ -298,17 +298,10 @@ static int meson_aiu_i2s_dma_close(struct snd_pcm_substream *substream)
+ }
+ 
+ static const struct snd_pcm_ops meson_aiu_i2s_dma_ops = {
+-	.open =		meson_aiu_i2s_dma_open,
+-	.close =        meson_aiu_i2s_dma_close,
+ 	.ioctl =	snd_pcm_lib_ioctl,
+-	.hw_params =	meson_aiu_i2s_dma_hw_params,
+-	.hw_free =      meson_aiu_i2s_dma_hw_free,
+-	.prepare =      meson_aiu_i2s_dma_prepare,
+-	.pointer =	meson_aiu_i2s_dma_pointer,
+-	.trigger =	meson_aiu_i2s_dma_trigger,
+ };
+ 
+-static int meson_aiu_i2s_dma_new(struct snd_soc_pcm_runtime *rtd)
++static int meson_aiu_i2s_dma_new(struct snd_soc_component *component, struct snd_soc_pcm_runtime *rtd)
+ {
+ 	struct snd_card *card = rtd->card->snd_card;
+ 	size_t size = meson_aiu_i2s_dma_hw.buffer_bytes_max;
+@@ -696,9 +689,15 @@ static struct snd_soc_dai_driver meson_aiu_i2s_dai = {
+ };
+ 
+ static const struct snd_soc_component_driver meson_aiu_i2s_component = {
+-	.ops = &meson_aiu_i2s_dma_ops,
+-	.pcm_new = meson_aiu_i2s_dma_new,
+-	.name	= DRV_NAME,
++	.name		= DRV_NAME,
++	.open		= meson_aiu_i2s_dma_open,
++	.close		= meson_aiu_i2s_dma_close,
++	.hw_params	= meson_aiu_i2s_dma_hw_params,
++	.hw_free	= meson_aiu_i2s_dma_hw_free,
++	.prepare	= meson_aiu_i2s_dma_prepare,
++	.pointer	= meson_aiu_i2s_dma_pointer,
++	.trigger	= meson_aiu_i2s_dma_trigger,
++	.pcm_construct	= meson_aiu_i2s_dma_new,
+ };
+ 
+ static int meson_aiu_i2s_probe(struct platform_device *pdev)
+-- 
+2.24.0
+

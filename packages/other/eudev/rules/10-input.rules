@@ -1,0 +1,5 @@
+ACTION=="remove", GOTO="default_end"
+
+SUBSYSTEM=="input", ENV{ID_INPUT}=="", IMPORT{builtin}="input_id"
+
+LABEL="default_end"

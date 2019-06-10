@@ -1,0 +1,25 @@
+From f4b3963e9606c2648c28d5d07e197cdcfcc23298 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Mon, 5 Aug 2019 10:56:31 +0300
+Subject: [PATCH] Fix undefined PATH_MAX under musl
+
+---
+ evtest.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/evtest.c b/evtest.c
+index 37d4f85..5931d9f 100644
+--- a/evtest.c
++++ b/evtest.c
+@@ -43,6 +43,8 @@
+ #include <config.h>
+ #endif
+ 
++#include <limits.h>
++
+ #include <linux/version.h>
+ #include <linux/input.h>
+ 
+-- 
+2.20.1
+

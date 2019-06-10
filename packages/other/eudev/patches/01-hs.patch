@@ -1,0 +1,12 @@
+diff --git a/src/udev/udev-rules.c b/src/udev/udev-rules.c
+index 766c00b..ccea778 100644
+--- a/src/udev/udev-rules.c
++++ b/src/udev/udev-rules.c
+@@ -53,6 +53,7 @@ static const char* const rules_dirs[] = {
+         UDEV_RULES_DIR,
+         UDEV_ROOT_RUN "/udev/rules.d",
+         UDEV_LIBEXEC_DIR "/rules.d",
++        "/storage/.config/udev-rules.d",
+ #ifdef HAVE_SPLIT_USR
+         "/lib/udev/rules.d",
+         "/usr/lib/udev/rules.d",

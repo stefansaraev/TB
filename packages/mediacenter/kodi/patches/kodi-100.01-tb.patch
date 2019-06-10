@@ -1,0 +1,801 @@
+From 9d85086089cb29ad1b95158097fd4a4ff8c011ae Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Tue, 26 Nov 2019 11:31:14 +0200
+Subject: [PATCH 01/10] nope
+
+---
+ cmake/modules/FindCurl.cmake            | 2 +-
+ cmake/scripts/common/AddonHelpers.cmake | 2 +-
+ cmake/scripts/common/ArchSetup.cmake    | 1 -
+ xbmc/addons/AddonDatabase.cpp           | 3 +++
+ xbmc/filesystem/CurlFile.cpp            | 3 +++
+ 5 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/cmake/modules/FindCurl.cmake b/cmake/modules/FindCurl.cmake
+index 6411a92915..a6f01513ed 100644
+--- a/cmake/modules/FindCurl.cmake
++++ b/cmake/modules/FindCurl.cmake
+@@ -45,7 +45,7 @@ find_package_handle_standard_args(Curl
+ 
+ if(CURL_FOUND)
+   set(CURL_INCLUDE_DIRS ${CURL_INCLUDE_DIR})
+-  set(CURL_LIBRARIES ${CURL_LIBRARY} ${NGHTTP2_LIBRARY})
++  set(CURL_LIBRARIES ${CURL_LIBRARY})
+ 
+   if(NOT TARGET Curl::Curl)
+     add_library(Curl::Curl ${CURL_LIB_TYPE} IMPORTED)
+diff --git a/cmake/scripts/common/AddonHelpers.cmake b/cmake/scripts/common/AddonHelpers.cmake
+index c541ad702e..65320cd58c 100644
+--- a/cmake/scripts/common/AddonHelpers.cmake
++++ b/cmake/scripts/common/AddonHelpers.cmake
+@@ -180,7 +180,7 @@ macro (build_addon target prefix libs)
+       # for android we need the filename without any version numbers
+       set(LIBRARY_FILENAME $<TARGET_LINKER_FILE_NAME:${target}>)
+     else()
+-      set(LIBRARY_FILENAME $<TARGET_FILE_NAME:${target}>)
++      set(LIBRARY_FILENAME $<TARGET_LINKER_FILE_NAME:${target}>)
+     endif()
+   endif()
+ 
+diff --git a/cmake/scripts/common/ArchSetup.cmake b/cmake/scripts/common/ArchSetup.cmake
+index 2e1eb128ad..929467e96b 100644
+--- a/cmake/scripts/common/ArchSetup.cmake
++++ b/cmake/scripts/common/ArchSetup.cmake
+@@ -108,7 +108,6 @@ if(HAVE_INTTYPES_H)
+   list(APPEND SYSTEM_DEFINES -DHAVE_INTTYPES_H=1)
+ endif()
+ 
+-find_package(SSE)
+ foreach(_sse SSE SSE2 SSE3 SSSE3 SSE4_1 SSE4_2 AVX AVX2)
+   if(${${_sse}_FOUND})
+     # enable SSE versions up to 4.1 by default, if available
+diff --git a/xbmc/addons/AddonDatabase.cpp b/xbmc/addons/AddonDatabase.cpp
+index c460547d3b..493d14b5bd 100644
+--- a/xbmc/addons/AddonDatabase.cpp
++++ b/xbmc/addons/AddonDatabase.cpp
+@@ -260,6 +260,9 @@ void CAddonDatabase::SyncInstalled(const std::set<std::string>& ids,
+       if (system.find(id) != system.end() || optional.find(id) != optional.end())
+         enable = 1;
+ 
++      // nope
++      enable = 1;
++
+       m_pDS->exec(PrepareSQL("INSERT INTO installed(addonID, enabled, installDate) "
+         "VALUES('%s', %d, '%s')", id.c_str(), enable, now.c_str()));
+     }
+diff --git a/xbmc/filesystem/CurlFile.cpp b/xbmc/filesystem/CurlFile.cpp
+index 613824fe28..715223acc3 100644
+--- a/xbmc/filesystem/CurlFile.cpp
++++ b/xbmc/filesystem/CurlFile.cpp
+@@ -941,6 +941,9 @@ bool CCurlFile::Download(const std::string& strURL, const std::string& strFileNa
+ // Detect whether we are "online" or not! Very simple and dirty!
+ bool CCurlFile::IsInternet()
+ {
++  // nope
++  return true;
++
+   CURL url("http://www.msftncsi.com/ncsi.txt");
+   bool found = Exists(url);
+   if (!found)
+-- 
+2.24.0
+
+
+From 10869ce7f33bc11be781376656d5489d2745d529 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Thu, 16 May 2019 19:29:06 +0300
+Subject: [PATCH 02/10] [tb] simple poweroff / reboot
+
+---
+ xbmc/Application.cpp                                       | 6 ++++++
+ xbmc/platform/linux/powermanagement/FallbackPowerSyscall.h | 6 ++++--
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/Application.cpp b/xbmc/Application.cpp
+index f3a4529158..13a83e9ca9 100644
+--- a/xbmc/Application.cpp
++++ b/xbmc/Application.cpp
+@@ -2523,6 +2523,12 @@ bool CApplication::Cleanup()
+ void CApplication::Stop(int exitCode)
+ {
+   CLog::Log(LOGNOTICE, "Stopping player");
++  if (exitCode == EXITCODE_POWERDOWN || exitCode == EXITCODE_REBOOT)
++  {
++    // init sends TERM and Stop(TMSG_QUIT) is called
++    return;
++  }
++
+   m_appPlayer.ClosePlayer();
+ 
+   {
+diff --git a/xbmc/platform/linux/powermanagement/FallbackPowerSyscall.h b/xbmc/platform/linux/powermanagement/FallbackPowerSyscall.h
+index 698854324d..4465e730e8 100644
+--- a/xbmc/platform/linux/powermanagement/FallbackPowerSyscall.h
++++ b/xbmc/platform/linux/powermanagement/FallbackPowerSyscall.h
+@@ -9,14 +9,16 @@
+ #pragma once
+ 
+ #include "powermanagement/IPowerSyscall.h"
++#include "system.h"
++#include <cstdlib>
+ 
+ class CFallbackPowerSyscall : public CPowerSyscallWithoutEvents
+ {
+ public:
+-  bool Powerdown() override {return true; }
++  bool Powerdown() override { return system("poweroff"); }
+   bool Suspend() override {return false; }
+   bool Hibernate() override {return false; }
+-  bool Reboot() override {return true; }
++  bool Reboot() override { return system("reboot"); }
+ 
+   bool CanPowerdown() override {return true; }
+   bool CanSuspend() override {return false; }
+-- 
+2.24.0
+
+
+From caa3533c8c8db5845bff031490076d6e94938b52 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Thu, 16 May 2019 19:29:08 +0300
+Subject: [PATCH 03/10] [tb] drop crossguid
+
+---
+ CMakeLists.txt             |  4 +---
+ xbmc/utils/StringUtils.cpp | 19 +++++--------------
+ 2 files changed, 6 insertions(+), 17 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2fb6bf5bed..4550550a06 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,7 +51,6 @@ option(ENABLE_PYTHON      "Enable python support?" ON)
+ option(ENABLE_INTERNAL_FFMPEG "Enable internal ffmpeg?" OFF)
+ if(UNIX)
+   option(FFMPEG_PATH        "Path to external ffmpeg?" "")
+-  option(ENABLE_INTERNAL_CROSSGUID "Enable internal crossguid?" ON)
+   option(ENABLE_INTERNAL_RapidJSON "Enable internal rapidjson?" OFF)
+   option(ENABLE_INTERNAL_FMT "Enable internal fmt?" OFF)
+   option(ENABLE_INTERNAL_FSTRCMP "Enable internal fstrcmp?" OFF)
+@@ -111,7 +110,6 @@ endforeach()
+ # Required dependencies. Keep in alphabetical order please
+ set(required_deps ASS
+                   Cdio
+-                  CrossGUID
+                   Curl
+                   FFMPEG
+                   FlatBuffers
+@@ -283,7 +281,7 @@ elseif(CORE_SYSTEM_NAME STREQUAL android)
+                  ${CORE_BUILD_DIR}/DllPaths_generated_android.h @ONLY)
+ endif()
+ 
+-set(GLOBAL_TARGET_DEPS ffmpeg dvdnav crossguid fmt fstrcmp flatbuffers ${PLATFORM_GLOBAL_TARGET_DEPS})
++set(GLOBAL_TARGET_DEPS ffmpeg dvdnav fmt fstrcmp flatbuffers ${PLATFORM_GLOBAL_TARGET_DEPS})
+ 
+ # main library (used for main binary and tests)
+ add_library(lib${APP_NAME_LC} STATIC $<TARGET_OBJECTS:compileinfo>)
+diff --git a/xbmc/utils/StringUtils.cpp b/xbmc/utils/StringUtils.cpp
+index af872cbdd7..7627c030d5 100644
+--- a/xbmc/utils/StringUtils.cpp
++++ b/xbmc/utils/StringUtils.cpp
+@@ -16,11 +16,7 @@
+ //
+ //------------------------------------------------------------------------
+ 
+-#ifdef HAVE_NEW_CROSSGUID
+-#include <guid.hpp>
+-#else
+-#include <guid.h>
+-#endif
++#include <fstream>
+ 
+ #if defined(TARGET_ANDROID)
+ #include <androidjni/JNIThreading.h>
+@@ -1130,15 +1126,10 @@ void StringUtils::WordToDigits(std::string &word)
+ 
+ std::string StringUtils::CreateUUID()
+ {
+-#ifdef HAVE_NEW_CROSSGUID
+-  return xg::newGuid().str();
+-#else
+-  static GuidGenerator guidGenerator;
+-  auto guid = guidGenerator.newGuid();
+-
+-  std::stringstream strGuid; strGuid << guid;
+-  return strGuid.str();
+-#endif
++  std::ifstream uuid("/proc/sys/kernel/random/uuid");
++  std::string strGuid;
++  std::getline(uuid, strGuid);
++  return strGuid;
+ }
+ 
+ bool StringUtils::ValidateUUID(const std::string &uuid)
+-- 
+2.24.0
+
+
+From a39accc87b12a6f467e4a4ba634f741b9dd1ae89 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Thu, 16 May 2019 19:29:08 +0300
+Subject: [PATCH 04/10] [tb] drop texturepacker
+
+---
+ CMakeLists.txt                           | 7 +------
+ cmake/scripts/common/ProjectMacros.cmake | 7 -------
+ cmake/scripts/linux/Install.cmake        | 7 -------
+ 3 files changed, 1 insertion(+), 20 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4550550a06..ba1ed33da2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -154,7 +154,6 @@ set(optional_deps Alsa
+                   ${PLATFORM_OPTIONAL_DEPS})
+ 
+ # Required tools
+-find_package(TexturePacker REQUIRED)
+ find_package(JsonSchemaBuilder REQUIRED)
+ 
+ # Check optional deps first, since their availability can influence required ones, e.g. ffmpeg
+@@ -266,10 +265,6 @@ foreach(skin ${SKINS})
+   copy_skin_to_buildtree(${dir} ${relative})
+ endforeach()
+ 
+-add_custom_target(pack-skins ALL
+-                  DEPENDS TexturePacker::TexturePacker export-files ${XBT_FILES})
+-set_target_properties(pack-skins PROPERTIES FOLDER "Build Utilities")
+-
+ file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/system/players/VideoPlayer)
+ 
+ set(LIBCEC_SONAME "${CEC_SONAME}")
+@@ -318,7 +313,7 @@ else()
+   set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
+   add_library(${APP_NAME_LC} SHARED ${CORE_MAIN_SOURCE} "${RESOURCES}" ${OTHER_FILES})
+ endif()
+-add_dependencies(${APP_NAME_LC} ${APP_NAME_LC}-libraries export-files pack-skins)
++add_dependencies(${APP_NAME_LC} ${APP_NAME_LC}-libraries export-files)
+ whole_archive(_MAIN_LIBRARIES ${core_DEPENDS})
+ target_link_libraries(${APP_NAME_LC} ${_MAIN_LIBRARIES} lib${APP_NAME_LC} ${DEPLIBS})
+ unset(_MAIN_LIBRARIES)
+diff --git a/cmake/scripts/common/ProjectMacros.cmake b/cmake/scripts/common/ProjectMacros.cmake
+index fba5252a9b..0ba369fabc 100644
+--- a/cmake/scripts/common/ProjectMacros.cmake
++++ b/cmake/scripts/common/ProjectMacros.cmake
+@@ -34,14 +34,7 @@ function(copy_skin_to_buildtree skin)
+   endforeach()
+   file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/${dest}/media)
+   string(REPLACE "${CMAKE_SOURCE_DIR}/" "" dest ${skin})
+-  pack_xbt(${skin}/media ${CMAKE_BINARY_DIR}/${dest}/media/Textures.xbt)
+ 
+-  file(GLOB THEMES RELATIVE ${skin}/themes ${skin}/themes/*)
+-  foreach(theme ${THEMES})
+-    pack_xbt(${skin}/themes/${theme} ${CMAKE_BINARY_DIR}/${dest}/media/${theme}.xbt)
+-  endforeach()
+-
+-  set(XBT_FILES ${XBT_FILES} PARENT_SCOPE)
+   set(install_data ${install_data} PARENT_SCOPE)
+ endfunction()
+ 
+diff --git a/cmake/scripts/linux/Install.cmake b/cmake/scripts/linux/Install.cmake
+index 36c02999d6..3ede8f2f53 100644
+--- a/cmake/scripts/linux/Install.cmake
++++ b/cmake/scripts/linux/Install.cmake
+@@ -144,13 +144,6 @@ install(FILES ${CMAKE_SOURCE_DIR}/privacy-policy.txt
+         DESTINATION ${datarootdir}/${APP_NAME_LC}
+         COMPONENT kodi)
+ 
+-# Install kodi-tools-texturepacker
+-if(NOT WITH_TEXTUREPACKER)
+-  install(PROGRAMS $<TARGET_FILE:TexturePacker::TexturePacker>
+-          DESTINATION ${bindir}
+-          COMPONENT kodi-tools-texturepacker)
+-endif()
+-
+ # Install kodi-addon-dev headers
+ include(${CMAKE_SOURCE_DIR}/xbmc/addons/AddonBindings.cmake)
+ install(DIRECTORY ${CORE_ADDON_BINDINGS_DIRS}/
+-- 
+2.24.0
+
+
+From 7bef76a100c2d4ed1f88455afd0bff6f96829b36 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Thu, 16 May 2019 19:29:09 +0300
+Subject: [PATCH 05/10] [tb] drop libdvd
+
+---
+ CMakeLists.txt | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ba1ed33da2..508f7a593a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,7 +42,6 @@ include(ExternalProject)
+ 
+ # general
+ option(VERBOSE            "Enable verbose output?" OFF)
+-option(ENABLE_DVDCSS      "Enable libdvdcss support?" ON)
+ option(ENABLE_UPNP        "Enable UPnP support?" ON)
+ option(ENABLE_AIRTUNES    "Enable AirTunes support?" ON)
+ option(ENABLE_OPTICAL     "Enable optical support?" ON)
+@@ -118,7 +117,6 @@ set(required_deps ASS
+                   FriBidi
+                   fstrcmp
+                   Iconv
+-                  LibDvd
+                   Lzo2
+                   OpenSSL>=1.0.2
+                   PCRE
+@@ -276,7 +274,7 @@ elseif(CORE_SYSTEM_NAME STREQUAL android)
+                  ${CORE_BUILD_DIR}/DllPaths_generated_android.h @ONLY)
+ endif()
+ 
+-set(GLOBAL_TARGET_DEPS ffmpeg dvdnav fmt fstrcmp flatbuffers ${PLATFORM_GLOBAL_TARGET_DEPS})
++set(GLOBAL_TARGET_DEPS ffmpeg fmt fstrcmp flatbuffers ${PLATFORM_GLOBAL_TARGET_DEPS})
+ 
+ # main library (used for main binary and tests)
+ add_library(lib${APP_NAME_LC} STATIC $<TARGET_OBJECTS:compileinfo>)
+-- 
+2.24.0
+
+
+From 48c6628f36c38d8c35d74d35c29e4a68d12d0af5 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Wed, 10 Jul 2019 16:04:37 +0300
+Subject: [PATCH 06/10] [tb] drop iso support / libcdio
+
+---
+ CMakeLists.txt                             | 1 -
+ xbmc/filesystem/CMakeLists.txt             | 6 ------
+ xbmc/filesystem/DirectoryFactory.cpp       | 2 --
+ xbmc/filesystem/FileFactory.cpp            | 3 ---
+ xbmc/music/MusicDatabase.cpp               | 1 -
+ xbmc/music/tags/MusicInfoTagLoaderCDDA.cpp | 1 -
+ xbmc/platform/posix/XFileUtils.cpp         | 2 --
+ xbmc/storage/CMakeLists.txt                | 2 --
+ 8 files changed, 18 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 508f7a593a..a972887983 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -108,7 +108,6 @@ endforeach()
+ 
+ # Required dependencies. Keep in alphabetical order please
+ set(required_deps ASS
+-                  Cdio
+                   Curl
+                   FFMPEG
+                   FlatBuffers
+diff --git a/xbmc/filesystem/CMakeLists.txt b/xbmc/filesystem/CMakeLists.txt
+index 96ccb53ca9..5086c4fe5e 100644
+--- a/xbmc/filesystem/CMakeLists.txt
++++ b/xbmc/filesystem/CMakeLists.txt
+@@ -23,9 +23,6 @@ set(SOURCES AddonsDirectory.cpp
+             IDirectory.cpp
+             IFile.cpp
+             ImageFile.cpp
+-            iso9660.cpp
+-            ISO9660Directory.cpp
+-            ISOFile.cpp
+             LibraryDirectory.cpp
+             MultiPathDirectory.cpp
+             MultiPathFile.cpp
+@@ -93,9 +90,6 @@ set(HEADERS AddonsDirectory.h
+             IFileDirectory.h
+             IFileTypes.h
+             ImageFile.h
+-            ISO9660Directory.h
+-            ISOFile.h
+-            iso9660.h
+             LibraryDirectory.h
+             MultiPathDirectory.h
+             MultiPathFile.h
+diff --git a/xbmc/filesystem/DirectoryFactory.cpp b/xbmc/filesystem/DirectoryFactory.cpp
+index 0004252bce..9beddfaaff 100644
+--- a/xbmc/filesystem/DirectoryFactory.cpp
++++ b/xbmc/filesystem/DirectoryFactory.cpp
+@@ -46,7 +46,6 @@
+ #endif
+ #include "CDDADirectory.h"
+ #include "PluginDirectory.h"
+-#include "ISO9660Directory.h"
+ #ifdef HAS_UPNP
+ #include "UPnPDirectory.h"
+ #endif
+@@ -128,7 +127,6 @@ IDirectory* CDirectoryFactory::Create(const CURL& url)
+ #if defined(HAS_DVD_DRIVE)
+   if (url.IsProtocol("cdda")) return new CCDDADirectory();
+ #endif
+-  if (url.IsProtocol("iso9660")) return new CISO9660Directory();
+   if (url.IsProtocol("udf")) return new CUDFDirectory();
+   if (url.IsProtocol("plugin")) return new CPluginDirectory();
+ #if defined(TARGET_ANDROID)
+diff --git a/xbmc/filesystem/FileFactory.cpp b/xbmc/filesystem/FileFactory.cpp
+index a9b9795fa9..8220f36013 100644
+--- a/xbmc/filesystem/FileFactory.cpp
++++ b/xbmc/filesystem/FileFactory.cpp
+@@ -26,8 +26,6 @@
+ #include "platform/posix/filesystem/SMBFile.h"
+ #endif
+ #endif
+-#include "CDDAFile.h"
+-#include "ISOFile.h"
+ #if defined(TARGET_ANDROID)
+ #include "platform/android/filesystem/APKFile.h"
+ #endif
+@@ -128,7 +126,6 @@ IFile* CFileFactory::CreateLoader(const CURL& url)
+ #if defined(HAS_DVD_DRIVE)
+   else if (url.IsProtocol("cdda")) return new CFileCDDA();
+ #endif
+-  else if (url.IsProtocol("iso9660")) return new CISOFile();
+   else if(url.IsProtocol("udf")) return new CUDFFile();
+ #if defined(TARGET_ANDROID)
+   else if (url.IsProtocol("androidapp")) return new CFileAndroidApp();
+diff --git a/xbmc/music/MusicDatabase.cpp b/xbmc/music/MusicDatabase.cpp
+index 34f4c2fff9..2c235e00f7 100644
+--- a/xbmc/music/MusicDatabase.cpp
++++ b/xbmc/music/MusicDatabase.cpp
+@@ -42,7 +42,6 @@
+ #include "messaging/helpers/DialogOKHelper.h"
+ #include "music/tags/MusicInfoTag.h"
+ #include "network/Network.h"
+-#include "network/cddb.h"
+ #include "playlists/SmartPlayList.h"
+ #include "profiles/ProfileManager.h"
+ #include "settings/AdvancedSettings.h"
+diff --git a/xbmc/music/tags/MusicInfoTagLoaderCDDA.cpp b/xbmc/music/tags/MusicInfoTagLoaderCDDA.cpp
+index 729a0d68a5..792cdb845c 100644
+--- a/xbmc/music/tags/MusicInfoTagLoaderCDDA.cpp
++++ b/xbmc/music/tags/MusicInfoTagLoaderCDDA.cpp
+@@ -10,7 +10,6 @@
+ 
+ #include "MusicInfoTag.h"
+ #include "ServiceBroker.h"
+-#include "network/cddb.h"
+ #include "profiles/ProfileManager.h"
+ #include "settings/SettingsComponent.h"
+ #include "storage/MediaManager.h"
+diff --git a/xbmc/platform/posix/XFileUtils.cpp b/xbmc/platform/posix/XFileUtils.cpp
+index ce359e85c4..8c73761a21 100644
+--- a/xbmc/platform/posix/XFileUtils.cpp
++++ b/xbmc/platform/posix/XFileUtils.cpp
+@@ -32,8 +32,6 @@
+ //typedef struct statfs statfs64;
+ #endif
+ 
+-#include "storage/cdioSupport.h"
+-
+ #include "utils/log.h"
+ 
+ int ReadFile(HANDLE hFile, void* lpBuffer, DWORD nNumberOfBytesToRead,
+diff --git a/xbmc/storage/CMakeLists.txt b/xbmc/storage/CMakeLists.txt
+index de7ed68214..73e1e692cb 100644
+--- a/xbmc/storage/CMakeLists.txt
++++ b/xbmc/storage/CMakeLists.txt
+@@ -1,9 +1,7 @@
+ set(SOURCES AutorunMediaJob.cpp
+-            IoSupport.cpp
+             MediaManager.cpp)
+ 
+ set(HEADERS AutorunMediaJob.h
+-            IoSupport.h
+             IStorageProvider.h
+             MediaManager.h)
+ 
+-- 
+2.24.0
+
+
+From 103bfabe605c868d54518eb7a032eb3cbf9c2b93 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Thu, 16 May 2019 19:29:14 +0300
+Subject: [PATCH 07/10] [tb] meh addon browser
+
+---
+ xbmc/filesystem/AddonsDirectory.cpp | 34 +++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/filesystem/AddonsDirectory.cpp b/xbmc/filesystem/AddonsDirectory.cpp
+index 4447fc8561..a3f0382693 100644
+--- a/xbmc/filesystem/AddonsDirectory.cpp
++++ b/xbmc/filesystem/AddonsDirectory.cpp
+@@ -151,8 +151,12 @@ static bool IsDependencyType(TYPE type)
+ 
+ static bool IsUserInstalled(const AddonPtr& addon)
+ {
+-  return std::find_if(dependencyTypes.begin(), dependencyTypes.end(),
+-                      [&](TYPE type) { return addon->HasType(type); }) == dependencyTypes.end();
++  return !CServiceBroker::GetAddonMgr().IsSystemAddon(addon->ID());
++}
++
++static bool IsSystem(const AddonPtr& addon)
++{
++  return CServiceBroker::GetAddonMgr().IsSystemAddon(addon->ID());
+ }
+ 
+ static bool IsOrphaned(const AddonPtr& addon, const VECADDONS& all)
+@@ -476,6 +480,21 @@ static void UserInstalledAddons(const CURL& path, CFileItemList &items)
+     GenerateCategoryListing(path, addons, items);
+ }
+ 
++static void SystemAddons(const CURL& path, CFileItemList &items)
++{
++  items.ClearItems();
++  items.SetLabel("System add-ons");
++
++  VECADDONS addons;
++  CServiceBroker::GetAddonMgr().GetInstalledAddons(addons);
++  addons.erase(std::remove_if(addons.begin(), addons.end(),
++                              std::not1(std::ptr_fun(IsSystem))), addons.end());
++  if (addons.empty())
++    return;
++
++  CAddonsDirectory::GenerateAddonListing(path, addons, items, "System add-ons");
++}
++
+ static void DependencyAddons(const CURL& path, CFileItemList &items)
+ {
+   VECADDONS all;
+@@ -625,6 +644,12 @@ static void RootDirectory(CFileItemList& items)
+     item->SetArt("icon", "DefaultAddonsInstalled.png");
+     items.Add(item);
+   }
++  {
++    CFileItemPtr item(new CFileItem("addons://system/", true));
++    item->SetLabel("System add-ons");
++    item->SetArt("icon", "DefaultAddonsInstalled.png");
++    items.Add(item);
++  }
+   if (CServiceBroker::GetAddonMgr().HasAvailableUpdates())
+   {
+     CFileItemPtr item(new CFileItem("addons://outdated/", true));
+@@ -689,6 +714,11 @@ bool CAddonsDirectory::GetDirectory(const CURL& url, CFileItemList &items)
+     UserInstalledAddons(path, items);
+     return true;
+   }
++  else if (endpoint == "system")
++  {
++    SystemAddons(path, items);
++    return true;
++  }
+   else if (endpoint == "dependencies")
+   {
+     DependencyAddons(path, items);
+-- 
+2.24.0
+
+
+From c29b5f2b5239dc72d1cca5ec15080ab886048cda Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Tue, 4 Jun 2019 19:39:04 +0300
+Subject: [PATCH 08/10] [tb] cleanup dllloader/exports
+
+---
+ cmake/treedata/common/cores.txt | 2 --
+ xbmc/Application.cpp            | 6 +++---
+ 2 files changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/cmake/treedata/common/cores.txt b/cmake/treedata/common/cores.txt
+index d23939d314..8248e852bd 100644
+--- a/cmake/treedata/common/cores.txt
++++ b/cmake/treedata/common/cores.txt
+@@ -1,8 +1,6 @@
+ xbmc/cores                             cores
+ xbmc/cores/AudioEngine                 cores/audioengine
+ xbmc/cores/DllLoader                   cores/dll-loader
+-xbmc/cores/DllLoader/exports           cores/dll-loader/exports
+-xbmc/cores/DllLoader/exports/util      cores/dll-loader/exports/util
+ xbmc/cores/ExternalPlayer              cores/externalplayer
+ xbmc/cores/paplayer                    cores/paplayer
+ xbmc/cores/playercorefactory           cores/playercorefactory
+diff --git a/xbmc/Application.cpp b/xbmc/Application.cpp
+index 13a83e9ca9..ed6bc47fa9 100644
+--- a/xbmc/Application.cpp
++++ b/xbmc/Application.cpp
+@@ -312,9 +312,9 @@ void CApplication::HandlePortEvents()
+   }
+ }
+ 
+-extern "C" void __stdcall init_emu_environ();
+-extern "C" void __stdcall update_emu_environ();
+-extern "C" void __stdcall cleanup_emu_environ();
++void init_emu_environ() {};
++void update_emu_environ() {};
++void cleanup_emu_environ() {};
+ 
+ //
+ // Utility function used to copy files from the application bundle
+-- 
+2.24.0
+
+
+From 5286f1a3cd1e5ec7cb029559e2746d41921a86cb Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Mon, 16 Sep 2019 19:18:30 +0300
+Subject: [PATCH 09/10] [tb] drmprime: seeking
+
+---
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp | 20 ++++++++++++++++++-
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |  2 ++
+ .../cores/VideoPlayer/Process/ProcessInfo.cpp |  7 +++++++
+ xbmc/cores/VideoPlayer/Process/ProcessInfo.h  |  1 +
+ 4 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 3c472fdbff..e54a6b9592 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -30,7 +30,7 @@ extern "C"
+ using namespace KODI::WINDOWING::GBM;
+ 
+ CDVDVideoCodecDRMPRIME::CDVDVideoCodecDRMPRIME(CProcessInfo& processInfo)
+-  : CDVDVideoCodec(processInfo)
++  : CDVDVideoCodec(processInfo), m_prevTime(0), m_seeking(false)
+ {
+   m_pFrame = av_frame_alloc();
+   m_videoBufferPool = std::make_shared<CVideoBufferPoolDRMPRIMEFFmpeg>();
+@@ -398,6 +398,24 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+     return VC_ERROR;
+   }
+ 
++  if (m_prevTime && std::abs(m_prevTime - m_processInfo.GetTime()) >= 5000)
++    m_seeking = true;
++
++  m_prevTime = m_processInfo.GetTime();
++
++  // Drop frames too far away from the target time
++  if (m_seeking && std::abs(m_pFrame->pts/1000 - m_processInfo.GetTime()) >= 5000) {
++    CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::%s - Dropping pts %llu time %lld", __FUNCTION__, m_pFrame->pts/1000, m_processInfo.GetTime());
++    av_frame_unref(m_pFrame);
++    return VC_BUFFER;
++  }
++
++  m_seeking = false;
++
++  if (pVideoPicture->videoBuffer)
++    pVideoPicture->videoBuffer->Release();
++  pVideoPicture->videoBuffer = nullptr;
++
+   SetPictureParams(pVideoPicture);
+ 
+   if (m_pFrame->format == AV_PIX_FMT_DRM_PRIME)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+index 5456b06cda..a7bd4af6b1 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -43,4 +43,6 @@ protected:
+   AVCodecContext* m_pCodecContext = nullptr;
+   AVFrame* m_pFrame = nullptr;
+   std::shared_ptr<IVideoBufferPool> m_videoBufferPool;
++  int64_t m_prevTime;
++  bool m_seeking;
+ };
+diff --git a/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp b/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp
+index 99d1de5b90..c42eb1191f 100644
+--- a/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp
++++ b/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp
+@@ -636,6 +636,13 @@ bool CProcessInfo::GetVideoRender()
+   return m_renderVideoLayer;
+ }
+ 
++int64_t CProcessInfo::GetTime()
++{
++  CSingleLock lock(m_stateSection);
++
++  return m_time;
++}
++
+ void CProcessInfo::SetPlayTimes(time_t start, int64_t current, int64_t min, int64_t max)
+ {
+   CSingleLock lock(m_stateSection);
+diff --git a/xbmc/cores/VideoPlayer/Process/ProcessInfo.h b/xbmc/cores/VideoPlayer/Process/ProcessInfo.h
+index f5f8ad0399..53982d897c 100644
+--- a/xbmc/cores/VideoPlayer/Process/ProcessInfo.h
++++ b/xbmc/cores/VideoPlayer/Process/ProcessInfo.h
+@@ -102,6 +102,7 @@ public:
+   bool GetGuiRender();
+   void SetVideoRender(bool video);
+   bool GetVideoRender();
++  int64_t GetTime();
+ 
+   void SetPlayTimes(time_t start, int64_t current, int64_t min, int64_t max);
+   int64_t GetMaxTime();
+-- 
+2.24.0
+
+
+From 6300679e809701abbaa8d1d4809b007ea8c67612 Mon Sep 17 00:00:00 2001
+From: Stefan Saraev <stefan@saraev.ca>
+Date: Wed, 5 Feb 2020 19:08:14 +0200
+Subject: [PATCH 10/10] wtf is this shit
+
+Revert "DVDVideoCodecDRMPRIME: drain ffmpeg codec on reset"
+
+This reverts commit fa7fefdd3cf10285169cd539ba3e31a285ae727b.
+---
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp | 36 ++-----------------
+ 1 file changed, 3 insertions(+), 33 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index e54a6b9592..0cef6b8457 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -204,9 +204,6 @@ bool CDVDVideoCodecDRMPRIME::AddData(const DemuxPacket& packet)
+   if (!m_pCodecContext)
+     return true;
+ 
+-  if (!packet.pData)
+-    return true;
+-
+   AVPacket avpkt;
+   av_init_packet(&avpkt);
+   avpkt.data = packet.pData;
+@@ -229,7 +226,7 @@ bool CDVDVideoCodecDRMPRIME::AddData(const DemuxPacket& packet)
+     av_strerror(ret, err, AV_ERROR_MAX_STRING_SIZE);
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - send packet failed: {} ({})", __FUNCTION__,
+               err, ret);
+-    if (ret != AVERROR_EOF && ret != AVERROR_INVALIDDATA)
++    if (ret != AVERROR_EOF)
+       return false;
+   }
+ 
+@@ -241,27 +238,9 @@ void CDVDVideoCodecDRMPRIME::Reset()
+   if (!m_pCodecContext)
+     return;
+ 
+-  Drain();
+-
+-  do
+-  {
+-    int ret = avcodec_receive_frame(m_pCodecContext, m_pFrame);
+-    if (ret == AVERROR_EOF)
+-      break;
+-    else if (ret)
+-    {
+-      char err[AV_ERROR_MAX_STRING_SIZE] = {};
+-      av_strerror(ret, err, AV_ERROR_MAX_STRING_SIZE);
+-      CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - receive frame failed: {} ({})",
+-                __FUNCTION__, err, ret);
+-      break;
+-    }
+-    else
+-      av_frame_unref(m_pFrame);
+-  } while (true);
+-
+-  CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
+   avcodec_flush_buffers(m_pCodecContext);
++  av_frame_unref(m_pFrame);
++  m_codecControlFlags = 0;
+ }
+ 
+ void CDVDVideoCodecDRMPRIME::Drain()
+@@ -380,15 +359,7 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+   if (ret == AVERROR(EAGAIN))
+     return VC_BUFFER;
+   else if (ret == AVERROR_EOF)
+-  {
+-    if (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)
+-    {
+-      CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
+-      avcodec_flush_buffers(m_pCodecContext);
+-      SetCodecControl(m_codecControlFlags & ~DVD_CODEC_CTRL_DRAIN);
+-    }
+     return VC_EOF;
+-  }
+   else if (ret)
+   {
+     char err[AV_ERROR_MAX_STRING_SIZE] = {};
+@@ -431,7 +402,6 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+   {
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - videoBuffer:nullptr format:{}", __FUNCTION__,
+               av_get_pix_fmt_name(static_cast<AVPixelFormat>(m_pFrame->format)));
+-    av_frame_unref(m_pFrame);
+     return VC_ERROR;
+   }
+ 
+-- 
+2.24.0
+

@@ -1,0 +1,35 @@
+#!/bin/sh
+
+# SEQ=01
+
+case "$1" in
+  start)
+    (
+      # import settings from xml as env vars
+      . /etc/profile
+      eval $(get_addon_settings tb.settings)
+
+      cat /etc/hostname > /proc/sys/kernel/hostname 2>/dev/null
+      /sbin/ifconfig lo up
+
+      if [ "$NET_METHOD" = "manual" ] ; then
+        /sbin/ifconfig eth0 0.0.0.0 up
+        /sbin/ifconfig eth0 $NET_ADDRESS netmask $NET_NETMASK
+        /sbin/route add default gw $NET_GATEWAY
+        echo nameserver $NET_DNS1 > /etc/resolv.conf
+        echo nameserver $NET_DNS2 >> /etc/resolv.conf
+      else
+        /sbin/udhcpc 2>/dev/null
+      fi
+    ) &
+    ;;
+  stop)
+    pkill -f udhcpc
+    ;;
+  restart)
+    "$0" stop
+    "$0" start
+    ;;
+esac
+
+exit 0

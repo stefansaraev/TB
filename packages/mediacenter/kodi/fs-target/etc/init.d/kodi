@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# SEQ=99
+
+case "$1" in
+  start)
+    /usr/lib/kodi/kodi.sh &>/dev/null &
+    ;;
+  stop)
+    pkill -TERM -f kodi
+    ;;
+esac
+
+exit 0

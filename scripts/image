@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: GPL-2.0-only
+
+. config/options $1
+
+check_root
+show_config
+
+scripts/checkdeps
+scripts/build toolchain
+
+BUILD_DATE=$(date +%m%d%H%M)
+GIT_ABBREV=$(git log -1 --pretty=format:%h --abbrev=10)
+DISTRO_VERSION=$OS_VERSION.$BUILD_DATE.$GIT_ABBREV
+IMAGE_NAME="TB.$PROJECT.$DISTRO_VERSION"
+
+rm -rf $INSTALL_IMAGE $STAMPS_INSTALL
+
+mkdir -p $INSTALL_IMAGE/boot
+mkdir -p $INSTALL_IMAGE/dev
+mkdir -p $INSTALL_IMAGE/etc
+mkdir -p $INSTALL_IMAGE/lib
+mkdir -p $INSTALL_IMAGE/proc
+mkdir -p $INSTALL_IMAGE/run
+mkdir -p $INSTALL_IMAGE/sys
+mkdir -p $INSTALL_IMAGE/tmp
+mkdir -p $INSTALL_IMAGE/usr
+mkdir -p $INSTALL_IMAGE/storage
+ln -sf usr/bin $INSTALL_IMAGE/bin
+ln -sf usr/sbin $INSTALL_IMAGE/sbin
+
+scripts/install base
+scripts/install mediacenter
+
+echo -e "NAME=\"TB\"" > $INSTALL_IMAGE/etc/os-release
+echo -e "PRETTY_NAME=\"TB - $DISTRO_VERSION\"" >> $INSTALL_IMAGE/etc/os-release
+
+echo "TB - $DISTRO_VERSION" >> $INSTALL_IMAGE/etc/issue
+ln -sf issue $INSTALL_IMAGE/etc/motd
+
+if [ -d "$PROJECT_DIR/fs-target" ]; then
+  cp -PR $PROJECT_DIR/fs-target/* $INSTALL_IMAGE
+fi
+
+for SERVICE in $INSTALL_IMAGE/etc/init.d/* ; do
+  SEQ="$(grep SEQ= $SERVICE | cut -d= -f2)"
+  ln -sf ../init.d/$(basename $SERVICE) $INSTALL_IMAGE/etc/rc.d/S$SEQ$(basename $SERVICE)
+done
+
+chmod 755 $INSTALL_IMAGE/usr/lib/*
+
+mkdir -p $TARGET_IMG
+cp -PR $BUILD/linux-*/arch/$TARGET_KERNEL_ARCH/boot/$KERNEL_TARGET $TARGET_IMG/$IMAGE_NAME.kernel
+cp -PR $BUILD/linux-*/arch/$TARGET_KERNEL_ARCH/boot/dtb.img $TARGET_IMG/$IMAGE_NAME.dtb.img 2>/dev/null || :
+mksquashfs $INSTALL_IMAGE $TARGET_IMG/$IMAGE_NAME.system -all-root -no-xattrs -noappend -comp xz -b 262144
+
+RELEASE_DIR="target/$IMAGE_NAME"
+rm -rf $RELEASE_DIR
+mkdir -p $RELEASE_DIR
+cp $TARGET_IMG/$IMAGE_NAME.system $RELEASE_DIR/root.sqfs
+cp $TARGET_IMG/$IMAGE_NAME.kernel $RELEASE_DIR/kernel.img
+cp $TARGET_IMG/$IMAGE_NAME.dtb.img $RELEASE_DIR/dtb.img 2>/dev/null || :
+tar cf $TARGET_IMG/$IMAGE_NAME.tar -C $RELEASE_DIR .
+
+rm -rf $RELEASE_DIR
+rm -f $TARGET_IMG/$IMAGE_NAME.system
+rm -f $TARGET_IMG/$IMAGE_NAME.kernel
+rm -f $TARGET_IMG/$IMAGE_NAME.dtb.img

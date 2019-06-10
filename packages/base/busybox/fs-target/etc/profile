@@ -1,0 +1,13 @@
+export HOME="/storage"
+export PATH="/usr/sbin:/usr/bin"
+export PS1='\[\033[01;31m\]\h\[\033[01;34m\] \w \$\[\033[00m\] '
+export EDITOR="nano"
+export PAGER=""
+
+export PATH="/storage/.extra/usr/bin:$PATH"
+
+for config in /etc/profile.d/*; do
+  if [ -f "$config" ] ; then
+    . $config
+  fi
+done

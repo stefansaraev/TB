@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: GPL-2.0-only
+
+. config/options $1
+
+if [ -z "$1" ]; then
+  echo "usage: $0 package_name"
+  exit 1
+fi
+
+check_package $1
+setup_toolchain target
+
+pack_addon() {
+  mkdir -p $ADDON_INSTALL
+
+  if [ ! -f $ADDON_INSTALL/addon.xml ] ; then
+    cp config/addon.xml $ADDON_INSTALL/addon.xml 2>/dev/null || :
+  fi
+  cp -R $PKG_DIR/source/* $ADDON_INSTALL 2>/dev/null || :
+
+  sed -e "s|@ADDON_ID@|$ADDON_ID|g" \
+      -e "s|@ADDON_NAME@|$PKG_NAME|g" \
+      -e "s|@ADDON_VERSION@|$OS_VERSION.$PKG_ADDON_REV|g" \
+      -e "s|@SUMMARY@|$PKG_NAME-$PKG_VERSION|g" \
+      -e "s|@DESCRIPTION@|$PKG_ADDON_DESC|g" \
+      -i $ADDON_INSTALL/addon.xml
+
+  cd $ADDON_BUILD
+  cleanup_rpath $ADDON_ID
+  if [ ! "$DEBUG" = yes ]; then
+    debug_strip $ADDON_ID
+  fi
+
+  ADDONVER=$(xmlstarlet sel -t -v "/addon/@version" $ADDON_INSTALL/addon.xml)
+  zip -rq $ADDON_ID-$ADDONVER.zip $ADDON_ID
+  cd - &>/dev/null
+
+  ADDON_INSTALL_DIR="target/addons/$OS_VERSION/$PROJECT/$ADDON_ID"
+  if [ -f $ADDON_INSTALL_DIR/$ADDON_ID-$ADDONVER.zip ] ; then
+    echo "*** WARNING: $ADDON_INSTALL_DIR/$ADDON_ID-$ADDONVER.zip exists. not overwriting it"
+    echo "*** WARNING: your addon is at $ADDON_INSTALL-$ADDONVER.zip"
+    return 0
+  fi
+
+  mkdir -p $ADDON_INSTALL_DIR
+  cp $ADDON_INSTALL-$ADDONVER.zip $ADDON_INSTALL_DIR
+  cp $ADDON_INSTALL/icon.png $ADDON_INSTALL_DIR/icon.png 2>/dev/null || :
+  echo "*** DONE: $ADDON_INSTALL_DIR/$ADDON_ID-$ADDONVER.zip"
+}
+
+if [ "$(type -t addon)" = "function" ]; then
+  ADDON_ID="$PKG_NAME"
+  if [ -z "$(echo $PKG_NAME | grep '\.')" ]; then
+    ADDON_ID="$(basename $(dirname $PKG_DIR)).$PKG_NAME"
+  fi
+  ADDON_BUILD="$BUILD/addons/$PKG_NAME"
+  ADDON_INSTALL="$ADDON_BUILD/$ADDON_ID"
+
+  rm -rf $ADDON_BUILD $ADDON_INSTALL
+
+  scripts/build $@
+  printf  "%${BUILD_INDENT}c CREATE ADDON  ($PROJECT) $1\n" ' '
+  export BUILD_INDENT=$((${BUILD_INDENT:-1}+4))
+  addon
+  pack_addon
+fi

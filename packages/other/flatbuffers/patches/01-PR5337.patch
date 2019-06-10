@@ -1,0 +1,35 @@
+From 2b52494047fb6e97af03e1801b42adc7ed3fd78a Mon Sep 17 00:00:00 2001
+From: vglavnyy <vg@glavny.org>
+Date: Thu, 9 May 2019 13:16:01 +0700
+Subject: [PATCH] Add detection of strtoull_l function (#5333)
+
+---
+ CMakeLists.txt | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 119855a95..370cc8ca1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,12 +42,18 @@ if(DEFINED FLATBUFFERS_MAX_PARSING_DEPTH)
+   message(STATUS "FLATBUFFERS_MAX_PARSING_DEPTH: ${FLATBUFFERS_MAX_PARSING_DEPTH}")
+ endif()
+ 
+-# Auto-detect locale-narrow 'strtod_l' function.
++# Auto-detect locale-narrow 'strtod_l' and  'strtoull_l' functions.
+ if(NOT DEFINED FLATBUFFERS_LOCALE_INDEPENDENT)
++  set(FLATBUFFERS_LOCALE_INDEPENDENT 0)
+   if(MSVC)
+-    check_cxx_symbol_exists(_strtof_l stdlib.h FLATBUFFERS_LOCALE_INDEPENDENT)
++    check_cxx_symbol_exists(_strtof_l stdlib.h FLATBUFFERS_HAS_STRTOF_L)
++    check_cxx_symbol_exists(_strtoui64_l stdlib.h FLATBUFFERS_HAS_STRTOULL_L)
+   else()
+-    check_cxx_symbol_exists(strtof_l stdlib.h FLATBUFFERS_LOCALE_INDEPENDENT)
++    check_cxx_symbol_exists(strtof_l stdlib.h FLATBUFFERS_HAS_STRTOF_L)
++    check_cxx_symbol_exists(strtoull_l stdlib.h FLATBUFFERS_HAS_STRTOULL_L)
++  endif()
++  if(FLATBUFFERS_HAS_STRTOF_L AND FLATBUFFERS_HAS_STRTOULL_L)
++    set(FLATBUFFERS_LOCALE_INDEPENDENT 1)
+   endif()
+ endif()
+ add_definitions(-DFLATBUFFERS_LOCALE_INDEPENDENT=$<BOOL:${FLATBUFFERS_LOCALE_INDEPENDENT}>)
